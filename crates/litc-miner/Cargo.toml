@@ -1,0 +1,9 @@
+[package]
+name = "litc-miner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+litc-primitives = { path = "../litc-primitives" }
+litc-pow = { path = "../litc-pow" }

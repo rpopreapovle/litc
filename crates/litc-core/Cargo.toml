@@ -1,0 +1,15 @@
+[package]
+name = "litc-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+litc-primitives = { path = "../litc-primitives" }
+litc-store = { path = "../litc-store" }
+litc-pow = { path = "../litc-pow" }
+
+[features]
+# `small` shrinks the PoW scratchpad for fast demo/test mining. Drop it
+# (e.g. `cargo test --no-default-features`) for the full 512 MB working set.
+default = ["litc-pow/small"]

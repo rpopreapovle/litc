@@ -1,0 +1,23 @@
+# LiTC example configuration (TOML)
+# Copy to config.toml and edit. All sections are optional with sane defaults.
+
+[network]
+testnet = true
+magic   = 0x4C315443   # "L1TC"
+port    = 19333
+
+[p2p]
+enabled  = false       # enable after the P2P stage (docs/protocol.md)
+max_peers = 8
+
+[node]
+socket   = "~/.litc/node.sock"   # local RPC over Unix socket (binary, litc-wire)
+rpc_bind = "127.0.0.1:9332"    # optional local RPC over TCP
+
+[miner]
+backend = "cpu"        # "cpu" always; "gpu" only with --features gpu
+threads = 0            # 0 = auto (logical CPUs)
+
+[wallet]
+keystore = "file"      # file | ledger | trezor (latter two later)
+path     = "~/.litc/wallet.dat"

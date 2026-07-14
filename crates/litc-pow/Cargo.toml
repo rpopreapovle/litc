@@ -1,0 +1,13 @@
+[package]
+name = "litc-pow"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+
+[features]
+# Use a tiny scratchpad so PoW-heavy tests run fast in debug. Real builds
+# (release, benchmarks) use the full 512 MB working set.
+small = []

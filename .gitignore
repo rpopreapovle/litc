@@ -1,0 +1,25 @@
+# Compiled output
+/target
+**/target
+
+# Node / wallet data
+*.dat
+*.dat.idx
+*.dat.meta
+*.stealth
+*.used
+config.toml
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Rust
+**/*.rs.bk
+Cargo.lock.bak
+
+# Runtime chain/wallet state
+/data

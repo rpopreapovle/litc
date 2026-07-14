@@ -1,0 +1,34 @@
+[package]
+name = "litc-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+litc-core = { path = "../litc-core" }
+litc-primitives = { path = "../litc-primitives" }
+litc-store = { path = "../litc-store" }
+litc-wallet = { path = "../litc-wallet" }
+litc-miner = { path = "../litc-miner" }
+litc-keystore = { path = "../litc-keystore" }
+litc-wire = { path = "../litc-wire" }
+litc-pow = { path = "../litc-pow" }
+litc-miner-gpu-wgpu = { path = "../litc-miner-gpu-wgpu", optional = true }
+
+[features]
+# The default build uses the small PoW scratchpad so the demo node mines
+# quickly without a 512 MB working set. (Release/full builds can drop
+# `small` for the real memory-hard parameter.)
+default = ["litc-pow/small"]
+# Build with the wgpu GPU mining backend and let `--gpu` select it.
+gpu = ["dep:litc-miner-gpu-wgpu", "litc-miner-gpu-wgpu/gpu"]
+
+[lib]
+name = "litc_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "litc-node"
+path = "src/main.rs"

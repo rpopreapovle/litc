@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/litc-wire",
+    "crates/litc-pow",
+    "crates/litc-primitives",
+    "crates/litc-store",
+    "crates/litc-core",
+    "crates/litc-wallet",
+    "crates/litc-miner",
+    "crates/litc-keystore",
+    "crates/litc-node",
+    "crates/litc-miner-gpu-wgpu",
+    "crates/litc-cli",
+    "crates/litc-ffi",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["LiTC contributors"]
+repository = "https://github.com/rpopreapovle/litc"
+homepage = "https://github.com/rpopreapovle/litc"
+description = "LiTC — a lightweight, post-quantum, CPU-friendly Proof-of-Work coin."

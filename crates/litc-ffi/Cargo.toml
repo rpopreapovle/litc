@@ -1,0 +1,13 @@
+[package]
+name = "litc-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "litc_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+litc-primitives = { path = "../litc-primitives" }
+litc-keystore = { path = "../litc-keystore" }

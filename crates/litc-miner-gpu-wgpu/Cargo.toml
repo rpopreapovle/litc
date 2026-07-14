@@ -1,0 +1,21 @@
+[package]
+name = "litc-miner-gpu-wgpu"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+litc-miner = { path = "../litc-miner" }
+litc-pow = { path = "../litc-pow" }
+litc-primitives = { path = "../litc-primitives" }
+sha2 = "0.10"
+pollster = "0.3"
+wgpu = { version = "0.19", optional = true }
+
+[features]
+default = []
+# Pulls in wgpu and enables the real GPU backend. Without it the crate only
+# re-exports the CPU miner, so default workspace builds stay light.
+gpu = ["dep:wgpu"]
