@@ -290,9 +290,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 outputs: vec![TxOut {
                     value: t.coinbase_value,
                     script_pubkey: t.coinbase_script.clone(),
-                    ephemeral: vec![],
                 }],
-                ephemeral: t.coinbase_ephemeral.clone(),
                 lock_time: 0,
             };
             let mut txs = vec![coinbase];

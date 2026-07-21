@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------
 // ML-DSA-2 (Dilithium, NIST FIPS 204)
 //
-// Stateless, reusable post-quantum signatures. Replaces WOTS+ (one-time) and
-// ML-KEM (stealth). The public key is 1312 bytes; the signature is ~2420 bytes.
-// Addresses are bech32m("litc", 0x31 || HASH160(pk)) — ~40 characters.
+// Stateless, reusable post-quantum signatures. The public key is 1312 bytes;
+// the signature is ~2420 bytes. Addresses are bech32m("litc", 0x31 || HASH160(pk))
+// — ~40 characters.
 // ---------------------------------------------------------------------------
 
 use ml_dsa::{MlDsa44, Signer, Verifier, KeyInit, KeyExport, Keypair, Seed, SignatureEncoding};

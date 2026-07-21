@@ -319,7 +319,7 @@ impl<S: SpendStore + StateStore> Node<S> {
 
     /// Filter the mempool down to transactions that will actually validate in a
     /// block right now: each must verify against the current UTXO set (correct
-    /// signatures, no already-burnt key, no inflation, and coinbase outputs
+    /// signatures, no double-spend, no inflation, and coinbase outputs
     /// mature enough) and must not double-spend an outpoint already claimed by
     /// another mempool transaction. The result is safe to hand to the miner, so
     /// a mined block always passes full validation and is accepted (guaranteeing
