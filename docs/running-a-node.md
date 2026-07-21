@@ -1,71 +1,89 @@
-# Running a LiTC Node (testnet MVP)
+# Running a LiTC Node
 
 ## Prerequisites
 
 - Rust stable (edition 2021+).
 - Linux (LiTC is Linux-first; portable elsewhere best-effort).
-- For GPU mining only: OpenCL runtime.
+- For GPU mining only: Vulkan driver (NVIDIA, AMD, or Intel).
 
 ## Build
 
 ```bash
-git clone <repo> && cd litc
-cargo build --locked              # CPU-only node + wallet + miner
-cargo build --locked --features gpu   # also the OpenCL miner crate
+git clone https://github.com/litc-project/litc && cd litc
+cargo build --locked                   # CPU node, wallet, CLI
+cargo build --locked --features gpu    # also build the wgpu GPU miner
 ```
 
-`--locked` uses the committed `Cargo.lock` → reproducible (see
-[reproducible-builds.md](reproducible-builds.md)).
-
-## Configure
-
-```bash
-cp config.toml.example config.toml
-```
-
-```toml
-[network]
-testnet = true
-magic   = 0x4C315443   # "L1TC"
-port    = 19333
-
-[p2p]
-enabled  = false       # turn on after the P2P stage
-max_peers = 8
-
-[node]
-socket   = "~/.litc/node.sock"   # local RPC (binary, litc-wire)
-rpc_bind = "127.0.0.1:9332"    # optional TCP RPC
-
-[miner]
-backend = "cpu"        # "gpu" only with --features gpu
-threads = 0            # 0 = auto
-
-[wallet]
-keystore = "file"
-path     = "~/.litc/wallet.dat"
-```
+The default build uses a small PoW scratchpad (`litc-pow/small`, 4096 lanes ×
+1024 walk steps) so mining is instant without a 512 MB working set. Drop the
+`small` feature for the real memory-hard parameter.
 
 ## Run
 
 ```bash
-litc node                        # runs the node + CPU miner, serves local RPC
-litc node --miner-backend gpu   # with --features gpu build
-litc cli wallet_new             # create address (via KeyStore)
-litc cli wallet_balance <addr>
-litc cli wallet_send <to> <amount>
-litc mine                        # optional separate miner connecting to the node
+# Mining node (default port 8333).
+cargo run -p litc-node --features litc-pow/small -- --port 8333
+
+# Relay-only node (syncs, does not mine).
+cargo run -p litc-node --features litc-pow/small -- --port 8334 \
+    --connect 127.0.0.1:8333 --no-mine
+
+# With GPU mining backend.
+cargo run -p litc-node --features gpu,litc-pow/small -- --port 8333 --gpu
+
+# With JSON-RPC API on port 18334.
+cargo run -p litc-node --features litc-pow/small -- --port 8333 --rpc-port 18334
 ```
 
-## What you get
+## Command-line flags
 
-- A block roughly every **15 seconds**.
-- A tx is `pending` in mempool immediately, `confirmed` after 1 block (fine
-  for everyday pay), `high` after 6.
-- Low, size-based fees.
-- GPU acceleration is optional; CPU mining is a first-class citizen.
+| Flag | Default | Description |
+|---|---|---|
+| `--port N` | `8333` | TCP listen port (P2P) |
+| `--rpc-port N` | (none) | Enable JSON-RPC on this port |
+| `--connect A` | — | Dial peer `A` on startup |
+| `--seed A` | — | Same as `--connect` (bootstrap seed) |
+| `--no-mine` | mining on | Disable CPU/GPU mining |
+| `--gpu` | CPU | Use wgpu GPU backend (requires `--features gpu`) |
+| `--archive` | prune on | Keep full block history (no pruning) |
+| `--verify-from-genesis` | — | Wipe state and replay from block 0 |
+| `--fast-sync <path>` | — | Load chain snapshot from `path` |
+| `--save-snapshot <path>` | — | Write state snapshot to `path` |
+| `--network <name>` | `testnet` | `testnet` or `mainnet` |
 
-## Next (later stages)
+## Environment
 
-When `[p2p] enabled = true`, the node connects to peers over the binary
-protocol in [protocol.md](protocol.md).
+| Variable | Default | Description |
+|---|---|---|
+| `LITC_DATADIR` | `./data` | Data directory (chain, wallet, mempool) |
+| `LITC_NETWORK` | `--network` value | Override `--network` |
+
+## State files
+
+Under `$LITC_DATADIR`:
+
+| File | Contents |
+|---|---|
+| `wallet.dat` | 32-byte master seed |
+| `chain.dat` | Append-only block records |
+| `chain.idx` | Block index for seeking |
+| `utxo.dat` | Live UTXO set |
+| `burnt.dat` | Spent-WOTS+ commitment index |
+| `tip.dat` | Current best-block hash |
+| `mempool/*.tx` | Pending signed transactions |
+
+## Wallet
+
+```bash
+# Create wallet and print addresses.
+cargo run -p litc-cli -- wallet new
+
+# Check balance.
+cargo run -p litc-cli -- wallet balance
+
+# Send coins.
+cargo run -p litc-cli -- wallet send <address> <amount>
+cargo run -p litc-cli -- wallet send-stealth <stealth-addr> <amount>
+```
+
+Or use the JSON-RPC API (see [rpc.md](rpc.md)).

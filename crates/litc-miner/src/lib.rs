@@ -1,7 +1,7 @@
 //! LiTC mining: build a block and find a PoW nonce via LiteHash.
 //!
 //! The miner is backend-agnostic through `MinerBackend`; `CpuMiner` is the
-//! always-available pure-Rust implementation. A GPU backend (OpenCL) can
+//! always-available pure-Rust implementation. A GPU backend (wgpu) can
 //! implement the same trait later behind a feature flag.
 
 use litc_pow::{meets_target, mine, prepare_epoch};
@@ -19,6 +19,10 @@ pub struct BlockTemplate {
     pub coinbase_value: Amount,
     /// Non-coinbase transactions to include.
     pub txs: Vec<Transaction>,
+    /// Root committing to the live consensus state after this block is applied
+    /// (see `docs/state.md`). Set by the node before mining so the PoW binds
+    /// the work to the resulting state.
+    pub state_root: Hash32,
 }
 
 /// A mining backend.
@@ -52,6 +56,7 @@ impl MinerBackend for CpuMiner {
                 version: 1,
                 prev_block: t.prev_block,
                 merkle_root: Hash32([0u8; 32]),
+                state_root: t.state_root,
                 timestamp: t.timestamp,
                 height: t.height,
                 epoch_seed: t.epoch_seed,
@@ -83,6 +88,39 @@ impl MinerBackend for CpuMiner {
     }
 }
 
+/// Build the candidate block from a template without mining (nonce = 0). Used
+/// by the node to compute the template's `state_root` before mining.
+pub fn assemble_block(t: &BlockTemplate) -> Block {
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![],
+        outputs: vec![TxOut {
+            value: t.coinbase_value,
+            script_pubkey: t.coinbase_commit.to_vec(),
+            ephemeral: vec![],
+        }],
+        ephemeral: vec![],
+        lock_time: 0,
+    };
+    let mut txs = vec![coinbase];
+    txs.extend(t.txs.iter().cloned());
+    let mut block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_block: t.prev_block,
+            merkle_root: Hash32([0u8; 32]),
+            state_root: t.state_root,
+            timestamp: t.timestamp,
+            height: t.height,
+            epoch_seed: t.epoch_seed,
+            nonce: 0,
+        },
+        txs,
+    };
+    block.recompute_merkle();
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,8 +133,9 @@ mod tests {
             timestamp: 1_700_000_000,
             epoch_seed: Hash32([2u8; 32]),
             coinbase_commit: [0xaa; 20],
-            coinbase_value: Amount(50 * 100_000_000),
+            coinbase_value: Amount(5 * 100_000_000),
             txs: vec![],
+            state_root: Hash32([0u8; 32]),
         };
         // ~4 bits of work: fast even in debug builds.
         let target = [0x0f; 32];

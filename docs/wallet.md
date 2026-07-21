@@ -19,8 +19,9 @@ The wallet is deliberately split from secret storage
   addresses are never reused (one-time signatures + built-in privacy).
 - For a **stable, reusable address**, the wallet also derives an ML-KEM-512
   encapsulation key from the master seed and exposes it as a stealth address
-  (`base58check(0x31 || kem_pk)` on mainnet, `0x70` on testnet). Give this
-  single address out; every payment you receive lands on a unique one-time
+  (Bech32m, HRP `litc`/`tlitc` on mainnet/testnet, version byte in the data).
+  Give this single address out; every payment you receive lands on a unique
+  one-time
   WOTS+ output that only your wallet can recognize and spend. See
   [stealth.md](stealth.md).
 

@@ -22,11 +22,13 @@ without reason. See [PHILOSOPHY.md](../PHILOSOPHY.md).
 - **Algorithm**: **our own**, memory-latency-bound PoW — **LiteHash**
   (see [pow.md](pow.md)). A **fixed 512 MB** scratchpad is the memory
   cost; the per-nonce **walk** is a data-dependent random read chain over it,
-  so all miners (old CPU, GTX 650, RTX 4090) bottleneck on **memory
-  latency**, not ALU — ASICs and flagships cannot dominate.
+   so the design goal is that miners (old CPU, GTX 650, modern GPU) bottleneck
+   on **memory latency**, not ALU. This fairness is a **hypothesis pending GPU
+   measurement** (see [pow.md](pow.md) / [benchmarks.md](benchmarks.md)); ASIC
+   and flagship dominance is *not yet* ruled out by data.
   - The 512 MB is filled **once per epoch** (`EPOCH_BLOCKS = 2400` ≈
     **10 h** at 15 s) from `SHA-256d(last block of prev epoch)` via a fast
-    ChaCha8 stream fill (<1 s, identical on every node). Mining never pauses:
+    sequential SHA-256d chain fill (~3 s, identical on every node). Mining never pauses:
     the next epoch's set is pre-built in a background thread near the switch.
   - Measured (Xeon E5-2689, release): `prepare_epoch` **~0.6 s**,
     `mine` **~585 H/s** per thread. Parameters `N`, `W`, `EPOCH_BLOCKS`
@@ -45,12 +47,17 @@ Derived from a **6-second** block time.
 | Difficulty retarget  | every 30 blocks (~7.5 min) | every 30 blocks        | fast convergence, DigiShield-lite, change clamped to ±25% |
 | Coinbase maturity    | 100 blocks ≈ **25 min**  | 100 blocks ≈ 25 min      | keep the *meaning* (short settle), not Bitcoin's 16 h |
 | Halving interval     | ~8,400,000 blocks ≈ **4 y** | **10,000** blocks     | 4-year cadence on mainnet; testnet compressed ×840 with documented multiplier |
-| Block reward (start) | 50 LIT                  | 50 LIT                    | familiar |
-| Supply cap           | 84,000,000 LIT          | 84,000,000 LIT           | familiar 4× Bitcoin supply choice |
+| Block reward (start) | 5 LIT                   | 5 LIT                     | halves every interval; see note below |
+| Supply cap           | 84,000,000 LIT          | 84,000,000 LIT           | fixed: total issuance converges to exactly 84M |
 
-> Note on halving: at 15 s, one Bitcoin-style ~4-year halving is
-> `4*365*24*3600/15 ≈ 8,409,600` blocks. Testnet uses 10,000 so emission is
-> observable quickly; the multiplier is recorded here, not hidden.
+> Note on halving and supply cap: at 15 s, one ~4-year halving is
+> `4*365*24*3600/15 ≈ 8,409,600` blocks. The block reward starts at 5 LIT and
+> halves every `HALVING_INTERVAL = 8,400,000` blocks (`subsidy = 5 LIT >> epoch`).
+> Total issuance is the geometric sum `5 LIT × 8,400,000 × 2 = 84,000,000 LIT`,
+> which is exactly the supply cap — no separate cap check is needed because the
+> subsidy reaches 0 once the halving epoch exceeds the subsidy's bit-width.
+> Testnet uses 10,000-block halvings so emission is observable quickly; the
+> multiplier is recorded here, not hidden.
 
 ## Blocks and transactions
 
@@ -69,7 +76,12 @@ Derived from a **6-second** block time.
 
 ### Transaction
 
-- Inputs: `(prev_txid, prev_index, WOTS+ witness, pubkey_root R)`.
+- Inputs: `(prev_txid, prev_index, scheme: SignatureScheme, WOTS+ witness,
+  pubkey_root R)`. `scheme` declares the signature algorithm authorizing the
+  spend (see Cryptography). Only `Wots256` is active at launch; reserved ids
+  (`Reserved1..3`) are recognized but not yet active, and any unknown id is
+  rejected — even with a valid signature. The scheme byte is part of the
+  signed message, so a signature is bound to its scheme.
 - Outputs: `(value, HASH160(R) script, ephemeral)`.
   - `ephemeral` is the ML-KEM ciphertext (768 bytes) attached to outputs sent
     to a **reusable stealth address**. It is empty (zero-length) for ordinary
@@ -81,9 +93,18 @@ Derived from a **6-second** block time.
 
 ### Block
 
-Header fields: `version`, `prev_hash`, `merkle_root`, `timestamp`, `target`,
-`nonce`. `merkle_root` = double-SHA-256 of transaction hashes. Genesis block
-is hardcoded with a fixed hash.
+Header fields: `version`, `prev_hash`, `merkle_root`, `state_root`,
+`timestamp`, `height`, `epoch_seed`, `nonce`. `merkle_root` = double-SHA-256
+of transaction hashes. `state_root` commits to the entire live consensus state
+(UTXO set + burnt one-time-key set) after the block is applied — see
+[state.md](state.md). `epoch_seed` seeds the PoW scratchpad for the current
+epoch (see [pow.md](pow.md)).
+
+**Genesis**: the genesis block is the first block mined at network launch
+(`height = 0`, `prev_hash = 0`). Its hash is pinned as a checkpoint at testnet
+launch (see Network parameters below) and is then treated as fixed — there is
+no pre-mined magic value, but once the network starts the genesis hash is
+immutable for that network.
 
 ## Cryptography
 
@@ -91,13 +112,17 @@ is hardcoded with a fixed hash.
   [wots.md](wots.md). Address = `base58check(version || HASH160(R))`, where `R`
   is the WOTS+ public root.
 - **Reusable addresses (stealth)**: the user-facing address is a fixed
-  **ML-KEM-512** encapsulation public key (800 bytes), base58check-encoded with
-  its own version byte (`0x31` mainnet, `0x70` testnet). Paying it wraps a
-  fresh one-time WOTS+ key (locked into the output's `HASH160(R)` script) and
-  carries the KEM ciphertext in `ephemeral`. The recipient scans the chain and
-  recovers the WOTS+ spend key. See [stealth.md](stealth.md). This hides the
-  one-time nature of WOTS+ behind the wallet: the user copies one address,
-  while every on-chain output is unique and unlinkable.
+  **ML-KEM-512** encapsulation public key (800 bytes), encoded as **Bech32m**
+  (HRP `litc` mainnet, `tlitc` testnet; the version byte `0x31`/`0x70` is
+  carried in the data). Bech32m keeps it lowercase and self-verifying. Paying
+  it wraps a fresh one-time WOTS+ key (locked into the output's `HASH160(R)`
+  script) and carries the KEM ciphertext in `ephemeral`. The recipient scans
+  the chain and recovers the WOTS+ spend key. See [stealth.md](stealth.md).
+  This hides the one-time nature of WOTS+ behind the wallet: the user copies
+  one address, while every on-chain output is unique and unlinkable. **The
+  string is still long** (~1.3k chars) because the full key is encoded — a
+  genuinely short address (hash-based, with the full key attached per output)
+  is tracked in [stealth.md](stealth.md) as future work.
 - **Hashing**: SHA-256d for merkle roots and internal digests.
 - **PoW**: LiteHash (see [pow.md](pow.md)).
 
@@ -112,6 +137,43 @@ Decoupled so each part can change independently:
 Implementations: `Memory*` (tests), `File*` (MVP). `sled` is **not** bound
 upfront; it may replace `File*` later behind the same traits.
 
+## Consensus state commitment
+
+The header commits to the entire live state via `state_root =
+SHA-256d(utxo_root || burnt_root)`, where `utxo_root` and `burnt_root` are
+Sparse Merkle Tree roots (keyed by `H(txid||index)` and `H(commitment)`
+respectively; see [state.md](state.md)). A bootstrapping node verifies the
+root by applying each block to a read-only overlay and recomputing it — the
+PoW therefore secures not just the UTXO *transitions* but the resulting state.
+
+**Snapshot / fast-sync** (done): a node can start from a trusted snapshot of
+the UTXO + burnt sets plus the tip block, instead of replaying every block
+from genesis. Loading is **trustless**: the file's `state_root` is recomputed
+from the loaded state and rejected on mismatch (tampering is detected, not
+trusted). Snapshot format is versioned (`magic "LITS"`, `version`); a fresh
+node then catches up over P2P. This bounds disk/CPU for weak nodes while
+keeping verification. See [state.md](state.md).
+
+## Network parameters and checkpoints
+
+Consensus constants are grouped per network in `ChainParams`
+(`litc-primitives::chainparams`):
+
+- `magic`: 4-byte wire prefix — `L1TC` (testnet), `L1TM` (mainnet). A mismatch
+  means a different network.
+- `halving_interval`: 10,000 (testnet, compressed) vs 8,400,000 (mainnet).
+- `genesis_hash`: pinned at network launch (see Block above).
+- `checkpoints`: a list of `(height, hash)`. A block at a checkpoint height
+  **must** carry the pinned hash; this irreversibly finalizes history at and
+  below the checkpoint and **bounds fast-sync trust** — a snapshot is only
+  accepted if its tip matches the highest checkpoint at or below its height.
+  With an empty checkpoint list (a brand-new testnet) this is a no-op; the
+  list is filled as the network grows, so "deep enough" becomes concrete
+  rather than a vague heuristic.
+
+The node selects the network via `--network <mainnet|testnet>` or the
+`LITC_NETWORK` env var (default: testnet).
+
 ## Wallet vs KeyStore
 
 - `litc-wallet` builds/queries transactions using stores + keystore. It holds
@@ -122,24 +184,26 @@ upfront; it may replace `File*` later behind the same traits.
 ## Mining (backend-agnostic)
 
 - `trait MinerBackend { fn mine(template, target, stop) -> Option<nonce> }`.
-- `CpuMiner` always available. `GpuMiner` (OpenCL crate, behind `gpu`
+- `CpuMiner` always available. `GpuMiner` (wgpu crate, behind `gpu`
   feature) optional. The node calls the backend abstractly.
 
-## Networking — staged, one binary format everywhere
+## Networking — one binary format everywhere
 
 All messaging — the node's local endpoint **and** P2P — uses the single
 `litc-wire` binary codec (see [rpc.md](rpc.md) and [protocol.md](protocol.md)).
 There is no JSON on any wire and no second serializer.
 
-1. **Local binary RPC first** (`litc-wire` + `litc-node` + `litc-cli`): the
-   node listens on a **Unix socket** (default `~/.litc/node.sock`) or TCP
-   `127.0.0.1`; `litc-cli` is the client. Enables fast automated tests with the
-   exact same frames P2P will use.
-2. **TCP P2P later** (`litc-p2p`): same `litc-wire` codec —
-   `version, verack, inv, getdata, tx, block, ping, pong, getaddr, addr`
-   (12 types). `getaddr`/`addr` let nodes discover peers with no hardcoded
-   seeds (decentralized). Compact-block relay (short tx IDs, BIP152-style) is
-   required here to keep propagation fast at 15 s / 750 KB blocks.
+- **Local binary RPC** (`litc-wire` + `litc-node` + `litc-cli`): the node
+  exposes the same `request`/`response` (cmd 11/12) frames over a local
+  transport; `litc-cli` is the client.
+- **TCP P2P** (done, in `litc-node`): same `litc-wire` codec over TCP —
+  `version, verack, inv, getdata, tx, block, ping, pong, getaddr, addr`
+  (plus the two RPC frames). Handshake exchanges `version`/`verack`, then nodes
+  announce `inv`, fetch with `getdata`, relay full `tx`/`block`, and gossip
+  addresses via `getaddr`/`addr` (no hardcoded seeds required). Rate limits
+  per peer guard against header-rain / tx-flood DoS. Compact-block relay
+  (short tx IDs, BIP152-style) is the planned fast path at 15 s / 750 KB blocks;
+  full `block` is the current fallback.
 
 ## Determinism
 

@@ -16,36 +16,42 @@ pub use litc_miner::{BlockTemplate, CpuMiner, MinerBackend};
 mod gpu {
     use super::{BlockTemplate, MinerBackend};
     use litc_pow::{meets_target, prepare_epoch, LANES, WALK};
-    use litc_primitives::{sha256d, to_bytes, Block, BlockHeader, Hash32, Transaction, TxOut};
+    use litc_primitives::{sha256d, to_bytes, Amount, Block, BlockHeader, Hash32, Transaction, TxOut};
     use std::sync::mpsc;
 
     const SHADER: &str = r#"
 struct Params {
     challenge: array<u32, 8>,
     seed: array<u32, 8>,
-    base: u32,
+    base_lo: u32,
+    base_hi: u32,
     lanes: u32,
     walk: u32,
-    _pad: u32,
+    emit: u32,
+    _pad: array<u32, 3>,
 };
 @group(0) @binding(0) var<storage, read> scratch: array<u32>;
-@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> params: Params;
 @group(0) @binding(2) var<storage, read_write> candidates: array<u32>;
 @group(0) @binding(3) var<storage, read_write> count: atomic<u32>;
 
-fn byte_of(word: u32, i: u32) -> u32 { (word >> ((3u - i) * 8u)) & 0xffu; }
+fn byte_of(word: u32, i: u32) -> u32 { return (word >> ((3u - i) * 8u)) & 0xffu; }
 
 fn add_byte(word: u32, i: u32, v: u32) -> u32 {
     let shift = (3u - i) * 8u;
-    let mask = 0xffu32 << shift;
-    let nb = (((word >> shift) & 0xffu32) + v) & 0xffu32;
-    (word & ~mask) | (nb << shift);
+    let mask = 0xffu << shift;
+    let nb = (((word >> shift) & 0xffu) + v) & 0xffu;
+    return (word & ~mask) | (nb << shift);
+}
+
+fn to_be(v: u32) -> u32 {
+    return (v << 24) | ((v & 0xff00u) << 8) | ((v >> 8) & 0xff00u) | (v >> 24u);
 }
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    let nonce = params.base + i;
+    let nonce = params.base_lo + i;
     var x: array<u32, 8>;
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { x[k] = params.challenge[k]; }
     // Fold the (little-endian) nonce into the top 4 bytes of x, per-byte with
@@ -54,23 +60,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     x[0] = add_byte(x[0], 1u, (nonce >> 8u) & 0xffu);
     x[0] = add_byte(x[0], 2u, (nonce >> 16u) & 0xffu);
     x[0] = add_byte(x[0], 3u, (nonce >> 24u) & 0xffu);
+    x[1] = add_byte(x[1], 0u, params.base_hi & 0xffu);
+    x[1] = add_byte(x[1], 1u, (params.base_hi >> 8u) & 0xffu);
+    x[1] = add_byte(x[1], 2u, (params.base_hi >> 16u) & 0xffu);
+    x[1] = add_byte(x[1], 3u, (params.base_hi >> 24u) & 0xffu);
     for (var w: u32 = 0u; w < params.walk; w = w + 1u) {
-        var acc: u64 = 0u;
-        acc = (acc << 8u) | u64(byte_of(x[0], 0u));
-        acc = (acc << 8u) | u64(byte_of(x[0], 1u));
-        acc = (acc << 8u) | u64(byte_of(x[0], 2u));
-        acc = (acc << 8u) | u64(byte_of(x[0], 3u));
-        acc = (acc << 8u) | u64(byte_of(x[1], 0u));
-        acc = (acc << 8u) | u64(byte_of(x[1], 1u));
-        acc = (acc << 8u) | u64(byte_of(x[1], 2u));
-        acc = (acc << 8u) | u64(byte_of(x[1], 3u));
-        let idx = u32(acc % u64(params.lanes));
+        // `acc` on the CPU is the 8-byte big-endian value of x[0..8]. WGSL has
+        // no u64, but `LANES` is always a power of two, so `acc % LANES` only
+        // depends on the low log2(LANES) bits. For LANES <= 2^24 those are the
+        // last 3 bytes of the 8-byte value, i.e. challenge/lane bytes 5..8,
+        // which are `x[1]` bytes 1..3 (x[1] = bytes 4..7 big-endian). Accumulating
+        // just those into a u32 matches the CPU `acc % LANES` exactly.
+        var acc: u32 = 0u;
+        acc = (acc << 8u) | byte_of(x[1], 1u);
+        acc = (acc << 8u) | byte_of(x[1], 2u);
+        acc = (acc << 8u) | byte_of(x[1], 3u);
+        let idx = acc % params.lanes;
         let base = idx * 8u;
-        for (var k: u32 = 0u; k < 8u; k = k + 1u) { x[k] = scratch[base + k]; }
+        for (var k: u32 = 0u; k < 8u; k = k + 1u) { x[k] = to_be(scratch[base + k]); }
     }
     // Loose pre-filter (~1/256) keeps the read-back set small; the CPU does
-    // the real target check.
-    if (byte_of(x[0], 0u) == 0u) {
+    // the real target check. When emit == 1 (test mode) every lane is written.
+    if (params.emit == 1u || byte_of(x[0], 0u) == 0u) {
         let c = atomicAdd(&count, 1u);
         if (c < arrayLength(&candidates) / 9u) {
             let o = c * 9u;
@@ -138,7 +149,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -189,8 +200,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 80,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                size: 96,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let cand_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -261,6 +272,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 version: 1,
                 prev_block: t.prev_block,
                 merkle_root: Hash32([0u8; 32]),
+                state_root: Hash32([0u8; 32]),
                 timestamp: t.timestamp,
                 height: t.height,
                 epoch_seed: t.epoch_seed,
@@ -276,7 +288,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 version: 1,
                 inputs: vec![],
                 outputs: vec![TxOut {
-                    value: Amount(50 * 100_000_000),
+                    value: Amount(5 * 100_000_000),
                     script_pubkey: t.coinbase_commit.to_vec(),
                     ephemeral: vec![],
                 }],
@@ -290,6 +302,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     version: 1,
                     prev_block: t.prev_block,
                     merkle_root: Hash32([0u8; 32]),
+                    state_root: Hash32([0u8; 32]),
                     timestamp: t.timestamp,
                     height: t.height,
                     epoch_seed: t.epoch_seed,
@@ -314,18 +327,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut base: u64 = 0;
 
             loop {
-                let base_u32 = (base & 0xffff_ffff) as u32;
-                let mut params: Vec<u8> = Vec::with_capacity(80);
+                let base_lo = (base & 0xffff_ffff) as u32;
+                let base_hi = (base >> 32) as u32;
+                let mut params: Vec<u8> = Vec::with_capacity(96);
                 for w in &chal_words {
                     params.extend_from_slice(&w.to_ne_bytes());
                 }
                 for w in &seed_words {
                     params.extend_from_slice(&w.to_ne_bytes());
                 }
-                params.extend_from_slice(&base_u32.to_ne_bytes());
+                params.extend_from_slice(&base_lo.to_ne_bytes());
+                params.extend_from_slice(&base_hi.to_ne_bytes());
                 params.extend_from_slice(&lanes.to_ne_bytes());
                 params.extend_from_slice(&walk.to_ne_bytes());
-                params.extend_from_slice(&0u32.to_ne_bytes());
+                params.extend_from_slice(&0u32.to_ne_bytes()); // emit = 0 (pre-filter)
+                params.extend_from_slice(&[0u8; 12]); // _pad: array<u32, 3>
                 self.queue.write_buffer(&self.params_buf, 0, &params);
                 self.queue
                     .write_buffer(&self.count_buf, 0, &0u32.to_ne_bytes());
@@ -368,9 +384,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             cands[p + 3],
                         ]);
                         let mut x_words = [0u32; 8];
-                        for k in 0..8 {
+                        for (k, slot) in x_words.iter_mut().enumerate() {
                             let q = (o + 1 + k) * 4;
-                            x_words[k] = u32::from_ne_bytes([
+                            *slot = u32::from_ne_bytes([
                                 cands[q],
                                 cands[q + 1],
                                 cands[q + 2],
@@ -446,6 +462,158 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let data = slice.get_mapped_range().to_vec();
         buf.unmap();
         data
+    }
+
+    #[cfg(test)]
+    impl WgpuMiner {
+        fn write_params(
+            &self,
+            nonce: u64,
+            challenge: &[u8; 32],
+            seed: &[u8; 32],
+            walk: u32,
+            emit: u32,
+        ) -> u32 {
+            let base_lo = (nonce & 0xffff_ffff) as u32;
+            let base_hi = (nonce >> 32) as u32;
+            let mut params: Vec<u8> = Vec::with_capacity(96);
+            for w in &u32_words(challenge) {
+                params.extend_from_slice(&w.to_ne_bytes());
+            }
+            for w in &u32_words(seed) {
+                params.extend_from_slice(&w.to_ne_bytes());
+            }
+            params.extend_from_slice(&base_lo.to_ne_bytes());
+            params.extend_from_slice(&base_hi.to_ne_bytes());
+            params.extend_from_slice(&(LANES as u32).to_ne_bytes());
+            params.extend_from_slice(&walk.to_ne_bytes());
+            params.extend_from_slice(&emit.to_ne_bytes());
+            params.extend_from_slice(&[0u8; 12]); // _pad: array<u32, 3>
+            self.queue.write_buffer(&self.params_buf, 0, &params);
+            self.queue
+                .write_buffer(&self.count_buf, 0, &0u32.to_ne_bytes());
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                c.set_pipeline(&self.pipeline);
+                c.set_bind_group(0, &self.bind_group, &[]);
+                c.dispatch_workgroups(1, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&self.count_buf, 0, &self.staging_count, 0, 4);
+            enc.copy_buffer_to_buffer(
+                &self.cand_buf,
+                0,
+                &self.staging_cand,
+                0,
+                self.max_cand * 9 * 4,
+            );
+            self.queue.submit(Some(enc.finish()));
+            read_u32(&self.device, &self.staging_count)
+        }
+
+        fn gpu_digest(
+            &self,
+            nonce: u64,
+            challenge: &[u8; 32],
+            seed: &[u8; 32],
+        ) -> [u8; 32] {
+            let x_bytes = self.gpu_x_steps_for_test(nonce, challenge, seed, WALK);
+            let nb = nonce.to_le_bytes();
+            let mut tail = Vec::with_capacity(32 + 32 + 8 + 32);
+            tail.extend_from_slice(&x_bytes);
+            tail.extend_from_slice(seed);
+            tail.extend_from_slice(&nb);
+            tail.extend_from_slice(challenge);
+            sha256d(&tail).0
+    }
+
+    fn gpu_x_steps_for_test(
+            &self,
+            nonce: u64,
+            challenge: &[u8; 32],
+            seed: &[u8; 32],
+            steps: usize,
+        ) -> [u8; 32] {
+            let scratch = prepare_epoch(seed);
+            self.queue.write_buffer(&self.scratch_buf, 0, scratch.as_bytes());
+            let _ = self.write_params(nonce, challenge, seed, steps as u32, 1);
+            self.queue
+                .write_buffer(&self.count_buf, 0, &0u32.to_ne_bytes());
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                c.set_pipeline(&self.pipeline);
+                c.set_bind_group(0, &self.bind_group, &[]);
+                c.dispatch_workgroups(1, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&self.count_buf, 0, &self.staging_count, 0, 4);
+            enc.copy_buffer_to_buffer(
+                &self.cand_buf,
+                0,
+                &self.staging_cand,
+                0,
+                self.max_cand * 9 * 4,
+            );
+            self.queue.submit(Some(enc.finish()));
+            let count = read_u32(&self.device, &self.staging_count);
+            let cands = read_bytes(&self.device, &self.staging_cand);
+            let base_lo = (nonce & 0xffff_ffff) as u32;
+            let mut x_words = [0u32; 8];
+            let n = (count as usize).min(cands.len() / (9 * 4));
+            for c in 0..n {
+                let p = c * 9 * 4;
+                if p + 9 * 4 > cands.len() {
+                    break;
+                }
+                let nonce_out = u32::from_ne_bytes([cands[p], cands[p + 1], cands[p + 2], cands[p + 3]]);
+                if nonce_out == base_lo {
+                    for (k, slot) in x_words.iter_mut().enumerate() {
+                        let q = p + (1 + k) * 4;
+                        *slot =
+                            u32::from_ne_bytes([cands[q], cands[q + 1], cands[q + 2], cands[q + 3]]);
+                    }
+                    break;
+                }
+            }
+            u32_bytes(&x_words)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use litc_pow::prepare_epoch;
+
+        const TEST_NONCES: [u64; 5] = [0, 1, 42, 7_777, 1_000_003];
+
+        #[test]
+        fn gpu_matches_cpu_hash() {
+            let miner = match WgpuMiner::new() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[gpu] skipping determinism test, no Vulkan adapter: {e}");
+                    return;
+                }
+            };
+            let seed = [0xABu8; 32];
+            let challenge = sha256d(&seed).0;
+            let scratch = prepare_epoch(&seed);
+            for &nonce in &TEST_NONCES {
+                let cpu = litc_pow::mine(&scratch, nonce, &challenge);
+                let gpu = miner.gpu_digest(nonce, &challenge, &seed);
+                assert_eq!(cpu, gpu, "GPU/CPU PoW digest mismatch at nonce {nonce}");
+            }
+        }
     }
 }
 

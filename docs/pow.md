@@ -22,7 +22,7 @@ comparable, so the dominant cost is **memory latency**, not ALU throughput.
   blocks.
 - Seed for an epoch = `SHA-256d(hash of last block of previous epoch)`.
 - The 512 MB set is reused across the whole epoch, so the heavy fill is
-  amortized (see benchmark: ~0.6 s per epoch, not per block).
+   amortized (see benchmark: ~3 s per epoch, not per block).
 - At the epoch switch the miner **pre-generates** the next epoch's
   scratchpad in a background thread ~2 blocks before the end, so mining
   never pauses.
@@ -78,9 +78,20 @@ The per-nonce cost is pure pointer-chasing over 512 MB, so it scales
 with memory latency, not core count or ALU — exactly the fairness goal.
 
 ## Next validation (GPU)
-Port the **walk** to OpenCL and run on the available RTX 3060 (proxy for
-RTX 4090) to confirm it lands within ~the same order of magnitude of
-H/s as the CPU. Target: close, not 100x. (See `benchmarks.md`.)
+Port the **walk** to wgpu (Vulkan) and measure on the available RTX 3060, **and** on
+at least one flagship (e.g. RTX 4090) and one low-end device. The RTX 3060 is
+**not** a proxy for the 4090 — the 4090 has ~3x the memory bandwidth and may
+parallelise the walk differently, so its H/s must be measured directly. The
+goal (close, not 100x) is a *hypothesis* until measured. (See `benchmarks.md`.)
+
+## Security status (honest limitations)
+LiteHash is **home-grown and unaudited.** The memory-latency-bound design is a
+*design intent*, not a proven theorem. Known open risks: a large on-die cache
+(ASIC / big-L3 CPU) could undercut the DRAM-latency cost for part of the pad,
+and GPU parallelism of the pointer-chasing walk is unmeasured. Both require the
+GPU benchmarks above before any mainnet fairness claim. The sequential fill
+removes the cheap O(1) lane-recompute attack that a CTR-mode stream fill (e.g.
+ChaCha8) would allow.
 
 ## Status
 Prototype in `litc-pow`: `prepare_epoch(seed)` + `mine(scratch, nonce)`,

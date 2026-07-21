@@ -21,8 +21,8 @@ fresh one-time signature key that only the recipient can unwrap.
 ## Layout
 
 ```
-Reusable address (what you share)   =  base58check(version || KEM_encaps_pk)
-   version: 0x31 mainnet, 0x70 testnet
+Reusable address (what you share)   =  Bech32m(litc/tlitc || version || KEM_encaps_pk)
+   HRP: "litc" mainnet, "tlitc" testnet; version byte 0x31 / 0x70 in the data
 
 Transaction (what the chain stores) =  (..., ephemeral)
    ephemeral = ML-KEM ciphertext (768 bytes)  [shared secret for all stealth
@@ -54,7 +54,8 @@ Non-stealth (legacy single-use) transactions simply have `ephemeral = []`.
 1. From the wallet master seed, derive a 64-byte KEM seed and build an
    **ML-KEM-512** keypair: encapsulation key `pk` (800 B) and decapsulation
    key `dk` (64 B seed). The decapsulation key is the **scan key**.
-2. Encode `pk` as the reusable address: `base58check(version || pk)`.
+ 2. Encode `pk` as the reusable address (Bech32m, HRP `litc`/`tlitc`):
+    `stealth_address(pk, version)`.
 
 ### Sending (sender)
 1. Decode the recipient's stealth address to get `pk`.
@@ -104,7 +105,8 @@ Non-stealth (legacy single-use) transactions simply have `ephemeral = []`.
   - `stealth_seed(shared) -> [u8;32]`
   - `stealth_script(shared, index) -> [u8;20]`
   - `stealth_address(kem_pk, version) -> String`
-  - `parse_stealth_address(s) -> Option<[u8;800]>`
+  - `parse_stealth_address(s) -> Option<(u8, [u8;800])>`  (returns the address
+    version alongside the KEM public key)
   - `build_stealth_output(kem_pk, value) -> (TxOut, [u8;768])`  (output
     + the tx-level ciphertext; script is `stealth_script(shared, 0)`)
   - `recover_stealth_keypair(kem_sk, ct) -> Option<WotsKeypair>` (index 0)

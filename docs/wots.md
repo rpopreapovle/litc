@@ -123,8 +123,10 @@ behind the wallet using **stealth addresses** built on a post-quantum KEM
 (ML-KEM-512), not on top of heavy XMSS trees:
 
 - The user's reusable address is just their ML-KEM **encapsulation public key**
-  (800 bytes, base58check with a dedicated version byte). One string, copied
-  once, reused forever.
+  (800 bytes), encoded as **Bech32m** (HRP `litc`/`tlitc`, version byte in the
+  data). One string, copied once, reused forever. The full key is still encoded,
+  so the string is long (~1.3k chars); a genuinely short address is future work
+  (see [stealth.md](stealth.md)).
 - To pay it, the sender encapsulates a shared secret, derives a **fresh
   one-time WOTS+ key** from that secret, and locks the output to
   `HASH160(R)` while attaching the KEM ciphertext in `TxOut.ephemeral`.
@@ -138,8 +140,10 @@ multi-use. Full design and code layout: [stealth.md](stealth.md).
 
 ## Sizes and throughput
 
-- Signature/witness ≈ 2.2 KB (constant `WOTS_SIG = (2 + L) * N = (2 + 67) * 32`);
-  address stays compact (20 B hash).
+- Signature/witness ≈ 1.1 KB (`WOTS_SIG = (2 + L) * N = (2 + 34) * 32 = 1152 B`, with
+  `W = 256`); the one-time WOTS+ address is a compact 20-byte `HASH160(R)`. The
+  reusable stealth address is long (Bech32m-encoded KEM key) — see
+  [stealth.md](stealth.md).
 - At the 750 KB block cap a block holds **~300 transactions** (a 1-in/2-out
   P2WOTS tx ≈ 2.3 KB; a stealth-involved tx ≈ 3 KB). At 15 s blocks that is
   ~20 TPS — above Bitcoin (~7) with headroom for launch. If the network fills
@@ -170,3 +174,26 @@ Mitigations:
 - `litc-store` — add a `BurntKeys` index.
 - `litc-core` — enforce one-time use during validation.
 - `litc-wallet` — deterministic fresh-address derivation from the master seed.
+
+## Multiple signature schemes (forward compatibility)
+
+Every input carries its scheme in `TxIn.scheme: SignatureScheme`, so the
+validator can mix schemes within one transaction once more than one is active:
+
+| id | scheme            | status                                    |
+|----|-------------------|-------------------------------------------|
+| 0  | `Wots256`         | **active** (launch): WOTS+ with `w = 256`)|
+| 1  | `Reserved1`       | recognized, not yet active                |
+| 2  | `Reserved2`       | recognized, not yet active                |
+| 3  | `Reserved3`       | recognized, not yet active                |
+| 255| `Unknown`         | never accepted                            |
+
+`validate_tx` dispatches on the scheme: only `Wots256` is verified today; a
+recognized-but-inactive reserved id is rejected with "reserved signature
+scheme not yet active", and any unrecognized id is rejected with "unknown
+signature scheme". Because the scheme byte is part of the signed message
+(`sighash` serializes the whole input, including `scheme`), a signature is
+cryptographically bound to its scheme — a `Wots256` signature cannot be
+replayed under a different scheme id. The reserved ids leave room for future
+post-quantum or hybrid constructions (e.g. a SPHINCS+-style few-time scheme, or
+Falcon + WOTS+) without a flag-day hard fork.

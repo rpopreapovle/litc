@@ -9,7 +9,7 @@
 
 use litc_core::sighash;
 use litc_keystore::{KeyStore, StealthKey};
-use litc_primitives::{kem, stealth, wots, Amount, Transaction, TxIn, TxOut};
+use litc_primitives::{kem, stealth, wots, Amount, SignatureScheme, Transaction, TxIn, TxOut};
 use litc_store::{SpendStore, UtxoStore};
 
 /// A wallet backed by a single 32-byte master seed.
@@ -142,6 +142,7 @@ impl Wallet {
             inputs: vec![TxIn {
                 prevout: op,
                 script_sig: vec![],
+                scheme: SignatureScheme::Wots256,
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![
@@ -199,7 +200,7 @@ impl Wallet {
         recipient: &str,
         value: Amount,
     ) -> Result<Transaction, String> {
-        let kem_pk = stealth::parse_stealth_address(recipient)
+        let (_, kem_pk) = stealth::parse_stealth_address(recipient)
             .ok_or_else(|| "not a stealth address".to_string())?;
         let kp = self.keypair_at(from_index);
         let commit = kp.pubkey_root_hash160();
@@ -240,6 +241,7 @@ impl Wallet {
             inputs: vec![TxIn {
                 prevout: op,
                 script_sig: vec![],
+                scheme: SignatureScheme::Wots256,
                 sequence: 0xFFFF_FFFF,
             }],
             outputs,
@@ -264,7 +266,7 @@ impl Wallet {
         let (_, sk) = self.kem_keypair();
         let mut known = ks.load_stealth().unwrap_or_default();
         let mut found = Vec::new();
-        for (op, out, ephemeral) in store.iter_utxos() {
+        for (op, out, ephemeral) in <S as UtxoStore>::iter_utxos(store) {
             if ephemeral.is_empty() {
                 continue;
             }
@@ -333,6 +335,7 @@ impl Wallet {
             inputs: vec![TxIn {
                 prevout: outpoint,
                 script_sig: vec![],
+                scheme: SignatureScheme::Wots256,
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![TxOut {
@@ -353,13 +356,12 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litc_core::{coinbase, connect_block};
+    use litc_core::{apply_block, coinbase, COINBASE_MATURITY};
     use litc_keystore::FileKeyStore;
     use litc_primitives::{Block, BlockHeader, Hash32};
     use litc_store::{BlockStore, ChainStore, MemoryStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const EASY: [u8; 32] = [0xff; 32];
     static TMP: AtomicUsize = AtomicUsize::new(0);
 
     fn tmp_ks() -> FileKeyStore {
@@ -384,19 +386,22 @@ mod tests {
         let w = Wallet::new([0xABu8; 32]);
         let ks = tmp_ks();
         let commit0 = w.commitment_at(0);
-        let (blk, _op) = coinbase(commit0, Amount(50 * 100_000_000), 0);
+        let (blk, _op) = coinbase(commit0, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        apply_block_raw(&mut store, &blk);
+        // Mature the genesis coinbase before spending it.
+        for _ in 0..COINBASE_MATURITY {
+            apply_block_tip(&mut store, vec![]);
+        }
 
         // Fresh recipient.
         let recip = Wallet::new([0xCDu8; 32]);
         let to = recip.commitment_at(0);
 
         let tx = w
-            .spend_from(&store, &ks, 0, to, Amount(10 * 100_000_000))
+            .spend_from(&store, &ks, 0, to, Amount(4 * 100_000_000))
             .unwrap();
-        let spend_block = block_with(&store, vec![tx]);
-        connect_block(&spend_block, &mut store, &EASY).unwrap();
+        apply_block_tip(&mut store, vec![tx]);
 
         // Change lands at index 1 (used); index 0 is burnt. Next free = 2.
         let idx = w.next_unused_index(&store, 1);
@@ -415,28 +420,32 @@ mod tests {
 
         // A receives a coinbase at legacy address 0.
         let commit0 = a.commitment_at(0);
-        let (blk, _op) = coinbase(commit0, Amount(50 * 100_000_000), 0);
+        let (blk, _op) = coinbase(commit0, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        apply_block_raw(&mut store, &blk);
+        // Mature the genesis coinbase before spending it.
+        for _ in 0..COINBASE_MATURITY {
+            apply_block_tip(&mut store, vec![]);
+        }
 
         // A pays B's reusable stealth address.
         let b_addr = b.stealth_address(stealth::STEALTH_VERSION_MAINNET);
         let tx = a
-            .send_stealth(&store, &a_ks, 0, &b_addr, Amount(10 * 100_000_000))
+            .send_stealth(&store, &a_ks, 0, &b_addr, Amount(4 * 100_000_000))
             .unwrap();
-        connect_block(&block_with(&store, vec![tx]), &mut store, &EASY).unwrap();
+        apply_block_tip(&mut store, vec![tx]);
 
         // B scans the chain and finds exactly one owned output.
         let owned = b.scan_chain(&store, &b_ks).unwrap();
         assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].value, Amount(10 * 100_000_000));
+        assert_eq!(owned[0].value, Amount(4 * 100_000_000));
 
         // B spends it back to one of A's addresses.
         let to = a.commitment_at(1);
         let spend_tx = b
             .spend_stealth(&store, &b_ks, owned[0].outpoint.clone(), to)
             .unwrap();
-        connect_block(&block_with(&store, vec![spend_tx]), &mut store, &EASY).unwrap();
+        apply_block_tip(&mut store, vec![spend_tx]);
 
         // The one-time stealth key is now burnt.
         assert!(store
@@ -461,6 +470,7 @@ mod tests {
                 version: 1,
                 prev_block: tip,
                 merkle_root: Hash32([0u8; 32]),
+                state_root: Hash32([0u8; 32]),
                 timestamp,
                 height,
                 epoch_seed,
@@ -470,5 +480,19 @@ mod tests {
         };
         b.recompute_merkle();
         b
+    }
+
+    /// Apply an already-built block without re-mining PoW (header/value
+    /// validation only) and advance the tip — keeps the suite fast.
+    fn apply_block_raw(store: &mut MemoryStore, b: &Block) {
+        apply_block(store, b).unwrap();
+        store.set_tip(b.block_hash(), b.header.height);
+    }
+
+    /// Build a block from `txs` (via `block_with`) and apply it without re-mining
+    /// PoW, then advance the tip.
+    fn apply_block_tip(store: &mut MemoryStore, txs: Vec<Transaction>) {
+        let b = block_with(store, txs);
+        apply_block_raw(store, &b);
     }
 }

@@ -308,9 +308,60 @@ pub struct OutPoint {
     pub index: u32,
 }
 
+/// Signature scheme used to authorize a transaction input. Only `Wots256` is
+/// active today; the reserved values leave room for future post-quantum (or
+/// hybrid) schemes without a chain-wide flag day, and `Unknown` rejects
+/// anything unrecognized. The scheme is carried per-input so a single
+/// transaction may mix schemes once more than one is active.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SignatureScheme {
+    /// WOTS+ with Winternitz parameter w = 256 (the launch scheme).
+    Wots256 = 0,
+    /// Reserved for a future scheme (e.g. a different WOTS+ parameterization).
+    Reserved1 = 1,
+    /// Reserved for a future scheme (e.g. a SPHINCS+-style few-time signature).
+    Reserved2 = 2,
+    /// Reserved for a future scheme (e.g. a hybrid Falcon + WOTS+ construction).
+    Reserved3 = 3,
+    /// Any scheme id not recognized by this implementation.
+    Unknown = 255,
+}
+
+impl SignatureScheme {
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            0 => SignatureScheme::Wots256,
+            1 => SignatureScheme::Reserved1,
+            2 => SignatureScheme::Reserved2,
+            3 => SignatureScheme::Reserved3,
+            _ => SignatureScheme::Unknown,
+        }
+    }
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+    /// Whether this scheme is accepted by the validator. Reserved schemes are
+    /// not yet active; `Unknown` is never accepted.
+    pub fn is_active(self) -> bool {
+        self == SignatureScheme::Wots256
+    }
+}
+
+impl Encodable for SignatureScheme {
+    fn encode(&self, w: &mut Vec<u8>) {
+        self.to_u8().encode(w);
+    }
+}
+impl Decodable for SignatureScheme {
+    fn decode(r: &mut Reader) -> Result<Self, String> {
+        Ok(SignatureScheme::from_u8(u8::decode(r)?))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TxIn {
     pub prevout: OutPoint,
+    pub scheme: SignatureScheme,
     pub script_sig: Vec<u8>,
     pub sequence: u32,
 }
@@ -358,6 +409,7 @@ impl Decodable for OutPoint {
 impl Encodable for TxIn {
     fn encode(&self, w: &mut Vec<u8>) {
         self.prevout.encode(w);
+        self.scheme.encode(w);
         self.script_sig.encode(w);
         self.sequence.encode(w);
     }
@@ -366,6 +418,7 @@ impl Decodable for TxIn {
     fn decode(r: &mut Reader) -> Result<Self, String> {
         Ok(TxIn {
             prevout: OutPoint::decode(r)?,
+            scheme: SignatureScheme::decode(r)?,
             script_sig: Vec::<u8>::decode(r)?,
             sequence: u32::decode(r)?,
         })
@@ -424,6 +477,11 @@ pub struct BlockHeader {
     pub version: u32,
     pub prev_block: Hash32,
     pub merkle_root: Hash32,
+    /// Root committing to the full live consensus state (UTXO set + burnt
+    /// keys) after this block is applied. See `docs/state.md`. Lets a node
+    /// bootstrap from a snapshot without trusting developers, peers, or
+    /// hardcoded checkpoints — only the Proof-of-Work securing the header.
+    pub state_root: Hash32,
     pub timestamp: u64,
     pub height: u64,
     pub epoch_seed: Hash32,
@@ -441,6 +499,7 @@ impl Encodable for BlockHeader {
         self.version.encode(w);
         self.prev_block.encode(w);
         self.merkle_root.encode(w);
+        self.state_root.encode(w);
         self.timestamp.encode(w);
         self.height.encode(w);
         self.epoch_seed.encode(w);
@@ -453,6 +512,7 @@ impl Decodable for BlockHeader {
             version: u32::decode(r)?,
             prev_block: Hash32::decode(r)?,
             merkle_root: Hash32::decode(r)?,
+            state_root: Hash32::decode(r)?,
             timestamp: u64::decode(r)?,
             height: u64::decode(r)?,
             epoch_seed: Hash32::decode(r)?,
@@ -608,6 +668,124 @@ pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
         return None;
     }
     Some((body[0], body[1..].to_vec()))
+}
+
+// ---------------------------------------------------------------------------
+// Bech32m (BIP350) — lowercase, checksummed, copy-friendly encoding. Used for
+// the (large) reusable stealth address so it is at least case-insensitive and
+// self-verifying. NOTE: this is *cosmetic* — the 800-byte KEM key is still
+// encoded in full, so the string stays long; a truly short address needs a
+// protocol change (see docs/stealth.md).
+// ---------------------------------------------------------------------------
+
+const BECH32_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+fn bech32_polymod(values: &[u8]) -> u32 {
+    let mut chk: u32 = 1;
+    for &v in values {
+        let top = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ (v as u32);
+        for (i, g) in [0x3b6a57, 0x26508e, 0x1ea119, 0x3d4233, 0x2a1462]
+            .iter()
+            .enumerate()
+        {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+fn bech32m_hrp_expand(hrp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hrp.len() * 2 + 1);
+    for &b in hrp {
+        out.push(b >> 5);
+    }
+    out.push(0);
+    for &b in hrp {
+        out.push(b & 0x1f);
+    }
+    out
+}
+
+fn bech32m_checksum(hrp: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut values = bech32m_hrp_expand(hrp);
+    values.extend_from_slice(data);
+    values.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let polymod = bech32_polymod(&values) ^ 0x2bc830a3;
+    (0..6)
+        .map(|i| ((polymod >> (5 * (5 - i))) & 0x1f) as u8)
+        .collect()
+}
+
+/// Convert `data` between bit groups. `pad = true` appends a final partial
+/// group; `pad = false` errors if leftover bits are non-zero.
+fn convertbits(data: &[u8], frombits: u32, tobits: u32, pad: bool) -> Option<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::new();
+    let maxv: u32 = (1 << tobits) - 1;
+    for &b in data {
+        acc = (acc << frombits) | (b as u32);
+        bits += frombits;
+        while bits >= tobits {
+            bits -= tobits;
+            out.push(((acc >> bits) & maxv) as u8);
+        }
+    }
+    if pad {
+        if bits > 0 {
+            out.push(((acc << (tobits - bits)) & maxv) as u8);
+        }
+    } else if bits >= frombits || ((acc << (tobits - bits)) & maxv) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Encode `payload` (raw bytes) as a Bech32m string with the given HRP.
+pub fn bech32m_encode(hrp: &str, payload: &[u8]) -> String {
+    let data = convertbits(payload, 8, 5, true).unwrap_or_default();
+    let checksum = bech32m_checksum(hrp.as_bytes(), &data);
+    let mut s = hrp.to_ascii_lowercase();
+    s.push('1');
+    for b in data.iter().chain(checksum.iter()) {
+        s.push(BECH32_CHARSET[*b as usize] as char);
+    }
+    s
+}
+
+/// Decode a Bech32m string, returning `(hrp, payload_bytes)`. `None` on any
+/// format or checksum error (including mixed case).
+pub fn bech32m_decode(s: &str) -> Option<(String, Vec<u8>)> {
+    if s.chars().any(|c| c.is_uppercase()) && s.chars().any(|c| c.is_lowercase()) {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    let pos = lower.rfind('1')?;
+    if pos == 0 || pos + 7 > lower.len() {
+        return None;
+    }
+    let hrp = &lower[..pos];
+    let data_part = &lower[pos + 1..];
+    if data_part.len() < 6 {
+        return None;
+    }
+    let mut data = Vec::with_capacity(data_part.len());
+    for c in data_part.chars() {
+        let idx = BECH32_CHARSET.iter().position(|b| *b == c as u8)?;
+        data.push(idx as u8);
+    }
+    let checksum = &data[data.len() - 6..];
+    let mut values = bech32m_hrp_expand(hrp.as_bytes());
+    values.extend_from_slice(&data[..data.len() - 6]);
+    values.extend_from_slice(checksum);
+    if bech32_polymod(&values) != 0x2bc830a3 {
+        return None;
+    }
+    let payload = convertbits(&data[..data.len() - 6], 5, 8, false)?;
+    Some((hrp.to_string(), payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,11 +1081,14 @@ pub mod kem {
 // Stealth addresses (reusable address + one-time WOTS+ output)
 //
 // A user's reusable address is just their KEM encapsulation public key
-// (800 bytes, base58check). To pay it, the sender encapsulates a shared
-// secret, derives a unique WOTS+ key from it, and locks the output to that
-// key's commitment while attaching the KEM ciphertext. The recipient scans
-// the chain, decapsulates each ciphertext with their scan secret, and recovers
-// the one-time WOTS+ spend key — without ever reusing an address.
+// (800 bytes), encoded as a Bech32m string (HRP `litc` mainnet / `tlitc`
+// testnet). Bech32m keeps it lowercase and self-verifying, though the string
+// is still long because the full key is encoded — a truly short address needs
+// a protocol change (see docs/stealth.md). To pay it, the sender encapsulates
+// a shared secret, derives a unique WOTS+ key from it, and locks the output to
+// that key's commitment while attaching the KEM ciphertext. The recipient
+// scans the chain, decapsulates each ciphertext with their scan secret, and
+// recovers the one-time WOTS+ spend key — without ever reusing an address.
 // ---------------------------------------------------------------------------
 
 pub mod stealth {
@@ -915,6 +1096,8 @@ pub mod stealth {
 
     pub const STEALTH_VERSION_MAINNET: u8 = 0x31;
     pub const STEALTH_VERSION_TESTNET: u8 = 0x70;
+    const HRP_MAINNET: &str = "litc";
+    const HRP_TESTNET: &str = "tlitc";
 
     const DOMAIN: &[u8] = b"litc-stealth-v1";
 
@@ -931,21 +1114,40 @@ pub mod stealth {
 
     /// The reusable (multi-use) stealth address from a KEM public key.
     pub fn stealth_address(kem_pk: &[u8; kem::KEM_PK_LEN], version: u8) -> String {
-        base58check_encode(version, kem_pk)
+        let hrp = if version == STEALTH_VERSION_MAINNET {
+            HRP_MAINNET
+        } else {
+            HRP_TESTNET
+        };
+        let mut payload = Vec::with_capacity(kem::KEM_PK_LEN + 1);
+        payload.push(version);
+        payload.extend_from_slice(kem_pk);
+        bech32m_encode(hrp, &payload)
     }
 
     /// Parse a stealth address back into a KEM public key (or `None`).
-    pub fn parse_stealth_address(s: &str) -> Option<[u8; kem::KEM_PK_LEN]> {
-        let (v, body) = base58check_decode(s)?;
-        if v != STEALTH_VERSION_MAINNET && v != STEALTH_VERSION_TESTNET {
+    pub fn parse_stealth_address(s: &str) -> Option<(u8, [u8; kem::KEM_PK_LEN])> {
+        let (hrp, body) = bech32m_decode(s)?;
+        if body.is_empty() {
             return None;
         }
-        if body.len() != kem::KEM_PK_LEN {
+        let v = body[0];
+        let expected_hrp = if v == STEALTH_VERSION_MAINNET {
+            HRP_MAINNET
+        } else if v == STEALTH_VERSION_TESTNET {
+            HRP_TESTNET
+        } else {
+            return None;
+        };
+        if hrp != expected_hrp {
+            return None;
+        }
+        if body.len() != 1 + kem::KEM_PK_LEN {
             return None;
         }
         let mut a = [0u8; kem::KEM_PK_LEN];
-        a.copy_from_slice(&body);
-        Some(a)
+        a.copy_from_slice(&body[1..]);
+        Some((v, a))
     }
 
     /// Build a one-time output paying a reusable stealth address: encapsulates
@@ -999,6 +1201,108 @@ pub mod stealth {
         c.copy_from_slice(ct);
         let ss = kem::kem_decaps(kem_sk, &c);
         Some(wots::WotsKeypair::derive(&stealth_seed(&ss), index))
+    }
+}
+
+/// Network-wide consensus constants that a node must agree on with its peers.
+/// These are *not* negotiated on the wire; a mismatch means you are on a
+/// different network (e.g. testnet vs mainnet).
+pub mod chainparams {
+    use crate::Hash32;
+
+    /// Which LiTC network a node participates in. Selects the wire magic,
+    /// emission schedule, and checkpoint set.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Network {
+        Mainnet,
+        Testnet,
+    }
+
+    impl Network {
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                Network::Mainnet => "mainnet",
+                Network::Testnet => "testnet",
+            }
+        }
+
+        pub fn from_str(s: &str) -> Option<Network> {
+            match s.to_ascii_lowercase().as_str() {
+                "mainnet" => Some(Network::Mainnet),
+                "testnet" => Some(Network::Testnet),
+                _ => None,
+            }
+        }
+    }
+
+    /// Consensus constants and the checkpoint set for one network.
+    #[derive(Debug, Clone)]
+    pub struct ChainParams {
+        pub network: Network,
+        /// 4-byte wire magic prefix used by `litc-wire` framing.
+        pub magic: [u8; 4],
+        /// Blocks between subsidy halvings. Testnet compresses mainnet's
+        /// 8,400,000 to 10,000 so emission is observable quickly.
+        pub halving_interval: u64,
+        /// Genesis block hash. For testnet this is pinned to whatever the first
+        /// seed node mines at network launch (set once, then treated as fixed).
+        /// For mainnet it is a hard-coded, pre-mined value.
+        pub genesis_hash: Option<[u8; 32]>,
+        /// Height -> block-hash checkpoints. A block at a checkpoint height MUST
+        /// carry the checkpoint hash; this irreversibly finalizes history at and
+        /// below the checkpoint and bounds the trust placed in a fast-sync
+        /// snapshot (see `docs/state.md`).
+        pub checkpoints: Vec<(u64, [u8; 32])>,
+    }
+
+    impl ChainParams {
+        /// Testnet parameters. `magic` is `L1TC`; emission is compressed
+        /// (`halving_interval = 10_000`). The genesis hash and checkpoint list
+        /// are empty until the testnet is launched and its first blocks are
+        /// pinned (see `docs/roadmap.md`).
+        pub fn testnet() -> Self {
+            ChainParams {
+                network: Network::Testnet,
+                magic: *b"L1TC",
+                halving_interval: 10_000,
+                genesis_hash: None,
+                checkpoints: Vec::new(),
+            }
+        }
+
+        /// Mainnet parameters. `magic` is `L1TM`; full 8,400,000-block halving.
+        pub fn mainnet() -> Self {
+            ChainParams {
+                network: Network::Mainnet,
+                magic: *b"L1TM",
+                halving_interval: 8_400_000,
+                genesis_hash: None,
+                checkpoints: Vec::new(),
+            }
+        }
+
+        /// The required hash at `height`, if `height` is a checkpoint.
+        pub fn checkpoint_hash(&self, height: u64) -> Option<Hash32> {
+            self.checkpoints
+                .iter()
+                .find(|(h, _)| *h == height)
+                .map(|(_, hash)| Hash32(*hash))
+        }
+
+        /// Height of the highest configured checkpoint, if any.
+        pub fn last_checkpoint_height(&self) -> Option<u64> {
+            self.checkpoints.iter().map(|(h, _)| *h).max()
+        }
+
+        /// The checkpoint hash that must be an ancestor of (or equal to) a tip
+        /// at `tip_height`, i.e. the highest checkpoint at or below `tip_height`.
+        pub fn checkpoint_at_or_below(&self, tip_height: u64) -> Option<Hash32> {
+            self.checkpoints
+                .iter()
+                .filter(|(h, _)| *h <= tip_height)
+                .max_by_key(|(h, _)| *h)
+                .map(|(_, hash)| Hash32(*hash))
+        }
     }
 }
 
@@ -1062,6 +1366,45 @@ mod tests {
     }
 
     #[test]
+    fn bech32m_roundtrip() {
+        // 800-byte payload like a KEM public key, prefixed with a version byte.
+        let mut payload = vec![0x31u8];
+        payload.extend_from_slice(&[0x42u8; 800]);
+        let s = bech32m_encode("litc", &payload);
+        assert!(s.starts_with("litc1"));
+        assert!(s.chars().all(|c| !c.is_uppercase()));
+        let (hrp, back) = bech32m_decode(&s).unwrap();
+        assert_eq!(hrp, "litc");
+        assert_eq!(back, payload);
+        // Tampered character breaks the checksum.
+        let mut chars: Vec<char> = s.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'p' { 'q' } else { 'p' };
+        let bad: String = chars.into_iter().collect();
+        assert!(bech32m_decode(&bad).is_none());
+        // Mixed case is invalid.
+        let mixed = s[..5].to_uppercase() + &s[5..];
+        assert!(bech32m_decode(&mixed).is_none());
+    }
+
+    #[test]
+    fn stealth_address_bech32m() {
+        let pk = [0x37u8; kem::KEM_PK_LEN];
+        let addr = stealth::stealth_address(&pk, stealth::STEALTH_VERSION_MAINNET);
+        assert!(addr.starts_with("litc1"));
+        let (_, back) = stealth::parse_stealth_address(&addr).unwrap();
+        assert_eq!(back, pk);
+        // Testnet HRP differs; both encode the same key so they decode to the
+        // same public key, but the address strings are distinct.
+        let taddr = stealth::stealth_address(&pk, stealth::STEALTH_VERSION_TESTNET);
+        assert!(taddr.starts_with("tlitc1"));
+        assert_eq!(addr, stealth::stealth_address(&pk, stealth::STEALTH_VERSION_MAINNET));
+        assert_ne!(addr, taddr);
+        assert_eq!(stealth::parse_stealth_address(&addr).unwrap().1, pk);
+        assert_eq!(stealth::parse_stealth_address(&taddr).unwrap().1, pk);
+    }
+
+    #[test]
     fn encode_decode_transaction() {
         let tx = Transaction {
             version: 1,
@@ -1070,6 +1413,7 @@ mod tests {
                     txid: Hash32([7u8; 32]),
                     index: 3,
                 },
+                scheme: SignatureScheme::Wots256,
                 script_sig: vec![1, 2, 3, 4],
                 sequence: 0xFFFF_FFFF,
             }],
@@ -1116,6 +1460,7 @@ mod tests {
                 version: 1,
                 prev_block: Hash32([1u8; 32]),
                 merkle_root: Hash32([2u8; 32]),
+                state_root: Hash32([4u8; 32]),
                 timestamp: 1_700_000_000,
                 height: 42,
                 epoch_seed: Hash32([3u8; 32]),
@@ -1172,5 +1517,35 @@ mod tests {
         let back = wots::decode_witness(&bytes).unwrap();
         let root_hash = kp.pubkey_root_hash160();
         assert!(back.verify(&msg, &root_hash));
+    }
+
+    #[test]
+    fn chainparams_networks_differ() {
+        let t = chainparams::ChainParams::testnet();
+        let m = chainparams::ChainParams::mainnet();
+        assert_eq!(t.network, chainparams::Network::Testnet);
+        assert_eq!(m.network, chainparams::Network::Mainnet);
+        assert_ne!(t.magic, m.magic);
+        assert_eq!(t.halving_interval, 10_000);
+        assert_eq!(m.halving_interval, 8_400_000);
+        assert_eq!(t.network.as_str(), "testnet");
+        assert_eq!(chainparams::Network::from_str("MAINNET"), Some(chainparams::Network::Mainnet));
+        assert_eq!(chainparams::Network::from_str("nope"), None);
+    }
+
+    #[test]
+    fn chainparams_checkpoints() {
+        let mut p = chainparams::ChainParams::testnet();
+        p.checkpoints = vec![
+            (100, [9u8; 32]),
+            (1_000, [7u8; 32]),
+            (10_000, [3u8; 32]),
+        ];
+        assert_eq!(p.checkpoint_hash(100), Some(Hash32([9u8; 32])));
+        assert_eq!(p.checkpoint_hash(101), None);
+        assert_eq!(p.last_checkpoint_height(), Some(10_000));
+        // Tip at 5_000 must descend from the checkpoint at height 1_000.
+        assert_eq!(p.checkpoint_at_or_below(5_000), Some(Hash32([7u8; 32])));
+        assert_eq!(p.checkpoint_at_or_below(99), None);
     }
 }

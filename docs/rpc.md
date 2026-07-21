@@ -1,56 +1,79 @@
-# LiTC Local RPC (binary, same format as P2P)
+# LiTC JSON-RPC API
 
-Before any TCP P2P, the node exposes its functionality over a **local binary
-RPC**. This is the first "network" layer and exists so the node, wallet, miner,
-and tests can talk immediately — no custom text format, no JSON.
+The node exposes an HTTP JSON-RPC 2.0 API on `127.0.0.1:<rpc-port>` for wallet
+operations, chain queries, and mining control.
 
-It reuses the single `litc-wire` codec (see [protocol.md](protocol.md)). The
-exact same `Message` frames used here are later used on the P2P wire. One
-format, everywhere.
+## Enable
 
-## Transport
-
-- Default: **Unix socket** `~/.litc/node.sock`.
-- Optional: TCP `127.0.0.1` (port from `[node] rpc_bind`).
-- Frames: `[magic:4][cmd:1][len:4][payload]` — identical to P2P.
-
-## Client
-
-`litc-cli` is the client:
-
-```bash
-litc node &
-litc cli get_info
-litc cli wallet_new
-litc cli wallet_send <to> <amount>
+```
+cargo run -p litc-node -- --port 8333 --rpc-port 18334
 ```
 
-No `curl`, no JSON — the wire is binary.
+The RPC server runs on a separate thread and shares the node state via
+`Arc<Mutex<...>>`. No auth is enforced (localhost only).
 
-## Requests / responses
+## Usage
 
-Local RPC adds two wire messages on top of the P2P set:
+```bash
+curl -s http://127.0.0.1:18334/ \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"<method>","params":[...],"id":1}'
+```
 
-| cmd | Name     | payload              | purpose |
-|-----|----------|----------------------|---------|
-| 11  | request  | id, method, params  | RPC call |
-| 12  | response | id, ok, data        | RPC result |
+## Methods
 
-Methods (binary-encoded params):
+### Blockchain
 
-- `get_info` → network, best height, best hash.
-- `get_block {hash|height}` → header + txids.
-- `get_height` → best height.
-- `send_tx {raw_tx}` → txid once **accepted into mempool** (`pending`).
-- `get_tx {txid}` → tx with status `pending` / `confirmed` / `high`.
-- `wallet_new` → new address (via KeyStore).
-- `wallet_balance {addr}` → confirmed + pending.
-- `wallet_send {to, amount}` → build, sign (KeyStore), submit.
-- `mine_once` → mine one block from mempool + coinbase.
-- `set_mining {enabled, backend}` → `cpu` (always) or `gpu` (feature).
+| Method | Params | Returns |
+|---|---|---|
+| `getblockcount` | `[]` | Current chain height |
+| `getbestblockhash` | `[]` | Hex of the current tip hash |
+| `getblockhash` | `[height]` | Block hash at `height` |
+| `getblock` | `[hash, verbose?]` | Block data (verbose=1: JSON, 0: hex) |
+| `getblock` | `[hash, 0]` | Raw hex-encoded block |
 
-## Why this comes before TCP
+### Wallet
 
-Writing P2P first would delay every test. With the local binary RPC the whole
-stack (chain, wallet, miner) is exercisable on day one, using the same codec
-P2P will use — so the integration test needs no sockets and no second format.
+| Method | Params | Returns |
+|---|---|---|
+| `getnewaddress` | `[]` | A new unused legacy address |
+| `getstealthaddress` | `[]` | The wallet's reusable stealth address |
+| `getbalance` | `[]` | Legacy + stealth balances (satoshis and formatted) |
+| `listunspent` | `[min_amount?]` | Array of UTXOs with txid, vout, amount |
+| `sendtoaddress` | `[to, amount, from_index?]` | Build, sign, and submit tx to legacy address |
+| `sendtostealthaddress` | `[to, amount, from_index?]` | Build, sign, and submit tx to stealth address |
+| `gettransaction` | `[txid]` | Transaction info (mempool only currently) |
+
+`amount` is either raw satoshis or `<n>.<frac>LIT` (e.g. `"10.5"` = 10.5 LIT).
+
+### Mining
+
+| Method | Params | Returns |
+|---|---|---|
+| `getmininginfo` | `[]` | Height, difficulty bits, mempool count |
+| `submitblock` | `[hex]` | `true` if block was accepted |
+
+### Network
+
+| Method | Params | Returns |
+|---|---|---|
+| `getpeerinfo` | `[]` | Array of connected peers with address |
+| `getconnectioncount` | `[]` | Number of connected peers |
+
+### General
+
+| Method | Params | Returns |
+|---|---|---|
+| `getinfo` | `[]` | Version, network, height, tip, difficulty, peers, mempool |
+| `getblockcount` | `[]` | Current chain height |
+
+## Errors
+
+Standard JSON-RPC 2.0 error codes:
+
+| Code | Meaning |
+|---|---|
+| `-32601` | Method not found |
+| `-32700` | Parse error |
+| `-5` | Invalid address, txid, or block hash |
+| `-25` | Block rejected |

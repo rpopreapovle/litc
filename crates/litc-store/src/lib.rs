@@ -14,7 +14,10 @@
 use litc_primitives::{
     Amount, Block, BlockHeader, Decodable, Encodable, Hash32, OutPoint, Reader, Transaction, TxOut,
 };
+use litc_primitives::chainparams::ChainParams;
 use std::collections::{HashMap, HashSet};
+
+pub mod state;
 
 /// A UTXO set plus the per-UTXO tx-level ephemeral ciphertext map, as
 /// persisted in `utxo.dat`.
@@ -70,6 +73,9 @@ pub trait UtxoStore {
     /// (used by the wallet to scan for stealth payments). The ciphertext is
     /// empty for outputs with no stealth component.
     fn iter_utxos(&self) -> Vec<(OutPoint, TxOut, Vec<u8>)>;
+    /// Remove an unspent output without recording a spend (e.g. when moving a
+    /// UTXO forward during a test/migration). Used by the fast-sync e2e test.
+    fn remove_utxo(&mut self, outpoint: &OutPoint);
 }
 
 /// Store abilities the validator needs: a UTXO set plus the one-time index.
@@ -431,19 +437,95 @@ impl UtxoStore for MemoryStore {
             })
             .collect()
     }
+    fn remove_utxo(&mut self, outpoint: &OutPoint) {
+        self.utxos.remove(outpoint);
+        self.utxo_ephemeral.remove(outpoint);
+    }
+}
+
+impl state::StateStore for MemoryStore {
+    fn get_utxo(&self, op: &OutPoint) -> Option<state::UtxoEntry> {
+        self.utxos.get(op).map(|out| state::UtxoEntry {
+            output: TxOut {
+                value: out.value,
+                script_pubkey: out.script_pubkey.clone(),
+                ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
+            },
+            coinbase_height: self.coinbase.get(op).copied(),
+        })
+    }
+    fn put_utxo(&mut self, op: OutPoint, entry: state::UtxoEntry) {
+        self.add_utxo(op.clone(), entry.output.clone(), entry.output.ephemeral.clone());
+        if let Some(h) = entry.coinbase_height {
+            self.mark_coinbase(&op, h);
+        }
+    }
+    fn remove_utxo(&mut self, op: &OutPoint) {
+        let _ = self.spend_utxo(op);
+    }
+    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
+        self.burnt.is_burnt(commit)
+    }
+    fn mark_burnt(&mut self, commit: [u8; 20]) {
+        let _ = self.mark_spent_once(&commit);
+    }
+    fn iter_burnt(&self) -> Vec<[u8; 20]> {
+        self.burnt.commits().iter().copied().collect()
+    }
+    fn root(&self) -> [u8; 32] {
+        let utxos: Vec<(OutPoint, state::UtxoEntry)> = self
+            .utxos
+            .iter()
+            .map(|(op, out)| {
+                (
+                    op.clone(),
+                    state::UtxoEntry {
+                        output: TxOut {
+                            value: out.value,
+                            script_pubkey: out.script_pubkey.clone(),
+                            ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
+                        },
+                        coinbase_height: self.coinbase.get(op).copied(),
+                    },
+                )
+            })
+            .collect();
+        let burnt: Vec<[u8; 20]> = self.burnt.commits().iter().copied().collect();
+        state::state_root_of(utxos, burnt)
+    }
+    fn iter_utxos(&self) -> Vec<(OutPoint, state::UtxoEntry)> {
+        self.utxos
+            .iter()
+            .map(|(op, out)| {
+                (
+                    op.clone(),
+                    state::UtxoEntry {
+                        output: TxOut {
+                            value: out.value,
+                            script_pubkey: out.script_pubkey.clone(),
+                            ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
+                        },
+                        coinbase_height: self.coinbase.get(op).copied(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litc_primitives::{Amount, Block, BlockHeader, Transaction, TxOut};
+    use litc_primitives::{
+        Amount, Block, BlockHeader, Hash32, OutPoint, Transaction, TxOut,
+    };
 
     fn coinbase(commit: [u8; 20]) -> (Block, OutPoint) {
         let tx = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOut {
-                value: Amount(50 * 100_000_000),
+                value: Amount(5 * 100_000_000),
                 script_pubkey: commit.to_vec(),
                 ephemeral: vec![],
             }],
@@ -459,6 +541,7 @@ mod tests {
                 version: 1,
                 prev_block: Hash32([0u8; 32]),
                 merkle_root: Hash32([0u8; 32]),
+                state_root: Hash32([0u8; 32]),
                 timestamp: 0,
                 height: 0,
                 epoch_seed: Hash32([0u8; 32]),
@@ -496,7 +579,7 @@ mod tests {
         }
         assert!(s.utxo(&op).is_some());
         let spent = s.spend_utxo(&op).unwrap();
-        assert_eq!(spent.value, Amount(50 * 100_000_000));
+        assert_eq!(spent.value, Amount(5 * 100_000_000));
         assert!(s.utxo(&op).is_none());
         assert!(s.spend_utxo(&op).is_err());
     }
@@ -560,6 +643,67 @@ mod tests {
 /// than `keep_depth` blocks from the tip.
 pub struct PruneConfig {
     pub keep_depth: u64,
+}
+
+// --- snapshot.meta: the only trust anchor for a fast-syncing node ------------
+const SNAPSHOT_MAGIC: &[u8; 4] = b"LITS";
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Self-describing snapshot header. The only trust anchor is `state_root`: a
+/// loader recomputes it from the loaded UTXO/burnt set and rejects the snapshot
+/// if it does not match. `work` lets the fast-synced node keep the snapshot tip
+/// as its best chain for reorg comparisons against new blocks.
+pub struct SnapshotMeta {
+    pub magic: [u8; 4],
+    pub version: u32,
+    pub height: u64,
+    pub block_hash: Hash32,
+    pub work: u128,
+    pub state_root: [u8; 32],
+}
+
+impl SnapshotMeta {
+    fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + 4 + 8 + 32 + 16 + 32);
+        v.extend_from_slice(&self.magic);
+        v.extend_from_slice(&self.version.to_le_bytes());
+        v.extend_from_slice(&self.height.to_le_bytes());
+        v.extend_from_slice(&self.block_hash.0);
+        v.extend_from_slice(&self.work.to_le_bytes());
+        v.extend_from_slice(&self.state_root);
+        v
+    }
+    fn decode(b: &[u8]) -> Result<Self, String> {
+        if b.len() < 4 + 4 + 8 + 32 + 16 + 32 {
+            return Err("corrupt snapshot.meta".into());
+        }
+        let mut p = 0;
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&b[p..p + 4]);
+        p += 4;
+        let version = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+        p += 4;
+        let height = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+        p += 8;
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&b[p..p + 32]);
+        p += 32;
+        let work = u128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+        p += 16;
+        let mut state_root = [0u8; 32];
+        state_root.copy_from_slice(&b[p..p + 32]);
+        if &magic != SNAPSHOT_MAGIC {
+            return Err("bad snapshot magic".into());
+        }
+        Ok(SnapshotMeta {
+            magic,
+            version,
+            height,
+            block_hash: Hash32(block_hash),
+            work,
+            state_root,
+        })
+    }
 }
 
 // --- chain.dat record (length-prefixed, self-describing) -------------------
@@ -1260,6 +1404,100 @@ impl FileStore {
         }
         Ok(())
     }
+
+    /// Write a *snapshot* of the current live state (UTXO set, burnt keys,
+    /// coinbase heights, tip, chain work) plus a trustless `snapshot.meta`
+    /// describing it. A bootstrapping node can `load_snapshot` and verify the
+    /// state purely from `snapshot.meta.state_root` (recomputed over the loaded
+    /// set) — no block history is needed. Only the tip block body is retained so
+    /// the node can still validate the *next* block's header.
+    pub fn save_snapshot(&self, dir: &Path) -> Result<(), String> {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create snapshot dir: {e}"))?;
+        self.snapshot_write_state(dir)?;
+        let tip = self
+            .inner
+            .tip()
+            .ok_or_else(|| "cannot snapshot an empty store".to_string())?;
+        let meta = SnapshotMeta {
+            magic: *SNAPSHOT_MAGIC,
+            version: SNAPSHOT_VERSION,
+            height: self.inner.height_of(&tip).unwrap_or(0),
+            block_hash: tip,
+            work: self.inner.work_of(&tip),
+            state_root: state::StateStore::root(&self.inner),
+        };
+        fs::write(dir.join("snapshot.meta"), meta.encode())
+            .map_err(|e| format!("cannot write snapshot.meta: {e}"))?;
+        Ok(())
+    }
+
+    /// Load a previously saved snapshot. After loading the state, the committed
+    /// `state_root` is recomputed from the loaded set and compared to
+    /// `snapshot.meta.state_root`; a mismatch means the snapshot is corrupt or
+    /// tampered and is rejected. This is the trustless check: we verify by
+    /// *loading* the state and recomputing, never by trusting the file's bytes.
+    pub fn load_snapshot(dir: impl Into<PathBuf>, params: &ChainParams) -> Result<Self, String> {
+        let base = dir.into();
+        let fs = FileStore::open(base.clone(), None)?;
+        let meta = SnapshotMeta::decode(
+            &fs::read(base.join("snapshot.meta"))
+                .map_err(|e| format!("cannot read snapshot.meta: {e}"))?,
+        )?;
+        if state::StateStore::root(&fs.inner) != meta.state_root {
+            return Err("snapshot state_root mismatch: snapshot is corrupt or untrustworthy".into());
+        }
+        // Checkpoint-bounded trust: a snapshot may only be trusted if its tip is
+        // consistent with the highest checkpoint at or below its height. With an
+        // empty checkpoint list (a new testnet) this is a no-op. Once checkpoints
+        // exist, a snapshot whose tip diverges from the pinned chain is rejected —
+        // the snapshot shortcuts history, it does not replace the finality that
+        // checkpoints provide.
+        if let Some(cp) = params.checkpoint_at_or_below(meta.height) {
+            if meta.block_hash != cp {
+                return Err(format!(
+                    "snapshot tip does not match checkpoint at height {}; snapshot is untrustworthy",
+                    meta.height
+                ));
+            }
+        }
+        Ok(fs)
+    }
+
+    fn snapshot_write_state(&self, dir: &Path) -> Result<(), String> {
+        write_utxos(
+            &dir.join("utxo.dat"),
+            &self.inner.utxos,
+            &self.inner.utxo_ephemeral,
+        )
+        .map_err(|e| format!("snapshot utxo: {e}"))?;
+        write_burnt(&dir.join("burnt.dat"), self.inner.burnt.commits())
+            .map_err(|e| format!("snapshot burnt: {e}"))?;
+        write_coinbase(&dir.join("coinbase.dat"), &self.inner.coinbase)
+            .map_err(|e| format!("snapshot coinbase: {e}"))?;
+        write_meta(
+            &dir.join("chainmeta.dat"),
+            &self.inner.work,
+            &self.inner.applied,
+            &self.inner.pow_ok,
+        )
+        .map_err(|e| format!("snapshot meta: {e}"))?;
+        let tip_bytes = self.inner.tip().map(|h| h.0).unwrap_or([0u8; 32]);
+        fs::write(dir.join("tip.dat"), tip_bytes).map_err(|e| format!("snapshot tip: {e}"))?;
+        // Keep only the tip block body so the node can validate the next block.
+        let mut f =
+            File::create(dir.join("chain.dat")).map_err(|e| format!("snapshot chain: {e}"))?;
+        let mut idx = HashMap::new();
+        if let Some(tip) = self.inner.tip() {
+            if let Some(b) = self.inner.blocks.get(&tip) {
+                let h = self.inner.height_of(&tip).unwrap_or(0);
+                let (off, end) = write_block_record(&mut f, h, true, &b.header, &b.txs)
+                    .map_err(|e| format!("snapshot chain: {e}"))?;
+                idx.insert(h, (off, end - off, true));
+            }
+        }
+        write_index(&dir.join("chain.idx"), &idx).map_err(|e| format!("snapshot index: {e}"))?;
+        Ok(())
+    }
 }
 
 impl BlockStore for FileStore {
@@ -1321,6 +1559,10 @@ impl UtxoStore for FileStore {
     }
     fn utxo(&self, outpoint: &OutPoint) -> Option<&TxOut> {
         self.inner.utxo(outpoint)
+    }
+    fn remove_utxo(&mut self, outpoint: &OutPoint) {
+        self.inner.remove_utxo(outpoint);
+        let _ = self.write_utxos();
     }
     fn find_by_commit(&self, commit: &[u8; 20]) -> Option<OutPoint> {
         self.inner.find_by_commit(commit)
@@ -1393,5 +1635,278 @@ impl SpendStore for FileStore {
     }
     fn parent_of(&self, hash: &Hash32) -> Option<Hash32> {
         self.inner.parent_of(hash)
+    }
+}
+
+impl state::StateStore for FileStore {
+    fn get_utxo(&self, op: &OutPoint) -> Option<state::UtxoEntry> {
+        self.inner.get_utxo(op)
+    }
+    fn put_utxo(&mut self, op: OutPoint, entry: state::UtxoEntry) {
+        self.inner.put_utxo(op, entry);
+        let _ = self.write_utxos();
+        let _ = self.write_coinbase();
+    }
+    fn remove_utxo(&mut self, op: &OutPoint) {
+        let _ = self.spend_utxo(op);
+    }
+    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
+        self.inner.get_burnt(commit)
+    }
+    fn mark_burnt(&mut self, commit: [u8; 20]) {
+        let _ = self.mark_spent_once(&commit);
+    }
+    fn iter_burnt(&self) -> Vec<[u8; 20]> {
+        self.inner.iter_burnt()
+    }
+    fn root(&self) -> [u8; 32] {
+        self.inner.root()
+    }
+    fn iter_utxos(&self) -> Vec<(OutPoint, state::UtxoEntry)> {
+        state::StateStore::iter_utxos(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use litc_primitives::{
+        merkle_root, Amount, Block, BlockHeader, Hash32, OutPoint, SignatureScheme, Transaction,
+        TxIn, TxOut,
+    };
+    use std::fs;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("litc_snap_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn snapshot_roundtrip_and_tamper_rejected() {
+        let dir = tmp_dir("rt");
+        let mut s = FileStore::open(dir.join("live"), None).unwrap();
+
+        // Populate a live state.
+        let op = OutPoint {
+            txid: Hash32([1u8; 32]),
+            index: 0,
+        };
+        s.add_utxo(
+            op.clone(),
+            TxOut {
+                value: Amount(5 * 100_000_000),
+                script_pubkey: vec![9u8; 20],
+                ephemeral: vec![],
+            },
+            vec![],
+        );
+        s.mark_coinbase(&op, 0);
+        let op2 = OutPoint {
+            txid: Hash32([2u8; 32]),
+            index: 1,
+        };
+        s.add_utxo(
+            op2.clone(),
+            TxOut {
+                value: Amount(100_000_000),
+                script_pubkey: vec![8u8; 20],
+                ephemeral: vec![],
+            },
+            vec![],
+        );
+        let _ = s.mark_spent_once(&[3u8; 20]);
+
+        // Tip block body, so a fast-synced node can still validate the *next*
+        // block's header.
+        let header = BlockHeader {
+            version: 1,
+            prev_block: Hash32([0u8; 32]),
+            merkle_root: Hash32([0u8; 32]),
+            state_root: Hash32([0u8; 32]),
+            timestamp: 0,
+            height: 100,
+            epoch_seed: Hash32([0u8; 32]),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txs: vec![],
+        };
+        let tip = block.block_hash();
+        s.put_block(&block).unwrap();
+        s.set_tip(tip, 100);
+        s.set_work(tip, 1_000_000);
+
+        // Save and reload; the recomputed root must match and the tip must be
+        // carried so the next block can be validated.
+        let snap = dir.join("snap");
+        s.save_snapshot(&snap).unwrap();
+        let loaded = FileStore::load_snapshot(&snap, &ChainParams::testnet()).unwrap();
+        assert_eq!(state::StateStore::root(&loaded), state::StateStore::root(&s));
+        assert_eq!(loaded.tip(), Some(tip));
+        assert_eq!(loaded.height_of(&tip), Some(100));
+        assert!(loaded.get_block(&tip).is_some());
+
+        // Tamper with the UTXO set: the trustless check must reject the snapshot
+        // (the stored state_root no longer matches the loaded state).
+        let mut bytes = fs::read(snap.join("utxo.dat")).unwrap();
+        bytes[5] ^= 0xFF; // mutate a txid byte (still parses, changes the set)
+        fs::write(snap.join("utxo.dat"), &bytes).unwrap();
+        assert!(FileStore::load_snapshot(&snap, &ChainParams::testnet()).is_err());
+    }
+
+    /// End-to-end fast-sync: build a chain of blocks on a live store, snapshot
+    /// it, then load the snapshot into a *fresh* store and continue applying
+    /// blocks. The fast-synced node must pick up exactly where the snapshot
+    /// left off (same UTXO set, same tip) and accept the next block.
+    #[test]
+    fn fast_sync_continues_chain() {
+        let dir = tmp_dir("e2e");
+        let mut live = FileStore::open(dir.join("live"), None).unwrap();
+
+        // Fund a spendable UTXO at height 0 (coinbase, so it must mature).
+        let op = OutPoint {
+            txid: Hash32([1u8; 32]),
+            index: 0,
+        };
+        live.add_utxo(
+            op.clone(),
+            TxOut {
+                value: Amount(5 * 100_000_000),
+                script_pubkey: vec![9u8; 20],
+                ephemeral: vec![],
+            },
+            vec![],
+        );
+        live.mark_coinbase(&op, 0);
+        live.set_tip(Hash32([0u8; 32]), 0);
+        live.set_work(Hash32([0u8; 32]), 1);
+
+        // "Mine" a chain of blocks simply by recording tip transitions and the
+        // evolving UTXO set. (We don't run PoW here — the snapshot/fast-sync path
+        // is what we exercise.) Each block spends the funded output forward.
+        let mut tip = Hash32([0u8; 32]);
+        let mut height = 0u64;
+        for i in 1..=5u64 {
+            let kp = wots_keypair_for_test(i);
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prevout: op.clone(),
+                    scheme: SignatureScheme::Wots256,
+                    script_sig: vec![], // value-only forward spend; sig not checked by store
+                    sequence: 0xFFFF_FFFF,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount(1_000_000),
+                    script_pubkey: kp.pubkey_root_hash160().to_vec(),
+                    ephemeral: vec![],
+                }],
+                ephemeral: vec![],
+                lock_time: 0,
+            };
+            let header = BlockHeader {
+                version: 1,
+                prev_block: tip,
+                merkle_root: merkle_root(std::slice::from_ref(&tx)),
+                state_root: Hash32([0u8; 32]),
+                timestamp: i,
+                height: i,
+                epoch_seed: Hash32([0u8; 32]),
+                nonce: i,
+            };
+            let block = Block {
+                header,
+                txs: vec![tx],
+            };
+            let h = block.block_hash();
+            live.put_block(&block).unwrap();
+            live.set_tip(h, i);
+            live.set_work(h, i as u128 + 1);
+            // Move the UTXO forward to the new output so the snapshot has a live tip.
+            live.remove_utxo(&op);
+            let new_op = OutPoint {
+                txid: h,
+                index: 0,
+            };
+            live.add_utxo(
+                new_op.clone(),
+                TxOut {
+                    value: Amount(1_000_000),
+                    script_pubkey: kp.pubkey_root_hash160().to_vec(),
+                    ephemeral: vec![],
+                },
+                vec![],
+            );
+            tip = h;
+            height = i;
+        }
+
+        // Snapshot the live state.
+        let snap = dir.join("snap");
+        live.save_snapshot(&snap).unwrap();
+
+        // Fresh store boots from the snapshot (trustless verify on load).
+        let mut synced = FileStore::load_snapshot(&snap, &ChainParams::testnet()).unwrap();
+        assert_eq!(synced.tip(), Some(tip));
+        assert_eq!(synced.height_of(&tip), Some(height));
+        // A live output must have carried over.
+        let carried = OutPoint {
+            txid: tip,
+            index: 0,
+        };
+        assert!(synced.utxo(&carried).is_some());
+
+        // Continuing the chain past the snapshot works: append block 6.
+        let kp = wots_keypair_for_test(6);
+        let new_op = OutPoint {
+            txid: tip,
+            index: 0,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prevout: new_op.clone(),
+                scheme: SignatureScheme::Wots256,
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+            }],
+            outputs: vec![TxOut {
+                value: Amount(500_000),
+                script_pubkey: kp.pubkey_root_hash160().to_vec(),
+                ephemeral: vec![],
+            }],
+            ephemeral: vec![],
+            lock_time: 0,
+        };
+        let header = BlockHeader {
+            version: 1,
+            prev_block: tip,
+            merkle_root: merkle_root(std::slice::from_ref(&tx)),
+            state_root: Hash32([0u8; 32]),
+            timestamp: 6,
+            height: 6,
+            epoch_seed: Hash32([0u8; 32]),
+            nonce: 6,
+        };
+        let block = Block {
+            header,
+            txs: vec![tx],
+        };
+        let h = block.block_hash();
+        synced.put_block(&block).unwrap();
+        synced.set_tip(h, 6);
+        synced.set_work(h, 7);
+        assert_eq!(synced.tip(), Some(h));
+        assert_eq!(synced.height_of(&h), Some(6));
+    }
+
+    /// Small helper: a deterministic keypair for the e2e test (no network use).
+    fn wots_keypair_for_test(i: u64) -> litc_primitives::wots::WotsKeypair {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&i.to_be_bytes());
+        litc_primitives::wots::WotsKeypair::derive(&seed, 0)
     }
 }

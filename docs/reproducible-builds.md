@@ -31,7 +31,7 @@ sha256sum -c litc.sha256   # must pass
 
 ## Notes
 
-- `litc-miner-gpu-opencl` is an optional feature; reproducible builds cover
+- `litc-miner-gpu-wgpu` is an optional feature; reproducible builds cover
   both `--features gpu` and the default CPU-only build.
 - If a future dependency breaks reproducibility, it is replaced — not worked
   around — because "Everything testable / Deterministic" is a core principle.

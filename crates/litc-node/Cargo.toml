@@ -17,6 +17,10 @@ litc-wire = { path = "../litc-wire" }
 litc-pow = { path = "../litc-pow" }
 litc-miner-gpu-wgpu = { path = "../litc-miner-gpu-wgpu", optional = true }
 
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
 [features]
 # The default build uses the small PoW scratchpad so the demo node mines
 # quickly without a 512 MB working set. (Release/full builds can drop

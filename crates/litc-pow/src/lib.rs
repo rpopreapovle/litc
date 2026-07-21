@@ -1,10 +1,13 @@
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "small")]
-pub const LANES: usize = 1 << 18; // 2^18 lanes * 32 B = 8 MB (fast tests)
+pub const LANES: usize = 1 << 12; // 2^12 lanes * 32 B = 128 KB (fast tests)
 #[cfg(not(feature = "small"))]
 pub const LANES: usize = 1 << 24; // 2^24 lanes * 32 B = 512 MB working set
 pub const LANE_BYTES: usize = 32;
+#[cfg(feature = "small")]
+pub const WALK: usize = 1 << 10; // shortened memory walk for fast test builds
+#[cfg(not(feature = "small"))]
 pub const WALK: usize = 1 << 16;
 
 pub fn scratch_bytes() -> usize {
@@ -167,6 +170,30 @@ pub fn mine(s: &Scratch, nonce: u64, challenge: &[u8; 32]) -> [u8; 32] {
     sha256d(&tail)
 }
 
+/// Return the final 32-byte lane `x` after the memory walk (before the trailing
+/// SHA-256d that yields the PoW digest). Exposed for determinism tests that
+/// compare the CPU reference against a GPU implementation.
+pub fn walk_x(s: &Scratch, nonce: u64, challenge: &[u8; 32]) -> [u8; 32] {
+    walk_x_steps(s, nonce, challenge, WALK)
+}
+
+/// Like [`walk_x`] but with an explicit number of walk steps (debug/testing).
+pub fn walk_x_steps(s: &Scratch, nonce: u64, challenge: &[u8; 32], steps: usize) -> [u8; 32] {
+    let mut x = *challenge;
+    let nb = nonce.to_le_bytes();
+    for k in 0..8 {
+        x[k] = x[k].wrapping_add(nb[k]);
+    }
+    for _ in 0..steps {
+        let mut acc: u64 = 0;
+        for &byte in &x[..8] {
+            acc = (acc << 8) | byte as u64;
+        }
+        x = s.v[(acc as usize) % LANES];
+    }
+    x
+}
+
 /// True if `digest <= target` (both compared as big-endian 256-bit integers).
 pub fn meets_target(digest: &[u8; 32], target: &[u8; 32]) -> bool {
     digest <= target
@@ -303,7 +330,7 @@ mod tests {
         #[cfg(not(feature = "small"))]
         assert_eq!(scratch_bytes(), 512 * 1024 * 1024);
         #[cfg(feature = "small")]
-        assert_eq!(scratch_bytes(), 8 * 1024 * 1024);
+        assert_eq!(scratch_bytes(), 128 * 1024);
     }
 
     #[test]

@@ -29,22 +29,22 @@ trait MinerBackend {
 ```
 
 - `CpuMiner` — always built, pure Rust. Proves mining with zero extra deps.
-- `GpuMiner` — OpenCL, in a **separate crate** `litc-miner-gpu-opencl`
-  behind the `gpu` feature, so a build without OpenCL stays simple.
+- `GpuMiner` — wgpu (Vulkan/Metal/DX12), in a **separate crate**
+  `litc-miner-gpu-wgpu` behind the `gpu` feature, so a build without GPU
+  deps stays simple.
 
 The node calls `backend.mine(...)` and knows nothing about the hardware.
 
 ## Running
 
 ```bash
-litc node                          # CPU miner only
-cargo build --features gpu && \
-litc node --miner-backend gpu   # OpenCL on commodity GPUs (GTX 650, RX 580)
-```
+# CPU miner only.
+litc node
 
-- `miner.threads = 0` → auto (logical CPUs).
-- Coinbase maturity (100 blocks ≈ 25 min) and reward follow
-  [specification.md](specification.md).
+# With GPU mining backend (requires --features gpu at build time).
+cargo build --features gpu
+litc node --gpu
+```
 
 ## Fairness goal
 

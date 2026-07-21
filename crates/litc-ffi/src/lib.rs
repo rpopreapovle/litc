@@ -25,7 +25,7 @@ use std::slice;
 
 use litc_keystore::random_seed;
 use litc_primitives::{
-    base58check_decode, kem, stealth, to_bytes, wots, Amount, Decodable, Reader, TxOut,
+    kem, stealth, to_bytes, wots, Amount, Decodable, Reader, TxOut,
 };
 
 thread_local! {
@@ -336,17 +336,13 @@ pub extern "C" fn litc_parse_stealth_address(
             return -1;
         }
     };
-    let (v, payload) = match base58check_decode(s) {
+    let (v, payload) = match stealth::parse_stealth_address(s) {
         Some(x) => x,
         None => {
-            set_err("not a base58check address");
+            set_err("not a valid stealth address");
             return -1;
         }
     };
-    if payload.len() != kem::KEM_PK_LEN {
-        set_err("address payload has wrong length");
-        return -1;
-    }
     unsafe {
         ptr::copy_nonoverlapping(payload.as_ptr(), out_pk, kem::KEM_PK_LEN);
         *out_testnet = if v == stealth::STEALTH_VERSION_TESTNET {

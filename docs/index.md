@@ -4,8 +4,8 @@ LiTC is a lightweight Proof-of-Work cryptocurrency for ordinary users.
 
 - **Light code** — small, readable Rust codebase.
 - **Light protocol** — minimal binary protocol, no JSON on the wire.
-- **Light launch** — one binary, TOML config, `cargo build --locked`.
-- **Light mining** — CPU + old GPUs (GTX 650) welcome; our own latency-bound algo, no ASIC needed.
+- **Light launch** — one binary, `cargo build --locked`.
+- **Light mining** — CPU + old GPUs welcome; latency-bound algo, no ASIC.
 - **Light spec** — a compact, open, documented protocol.
 
 ## At a glance
@@ -15,11 +15,12 @@ LiTC is a lightweight Proof-of-Work cryptocurrency for ordinary users.
 | Consensus           | Proof of Work (LiteHash, 512 MB, latency-bound) |
 | Block time          | ~15 seconds                             |
 | Confirmations       | 1 block = everyday pay; 6 = high value |
-| Mining              | CPU + GPU; our own latency-bound algo     |
-| Cryptography        | WOTS+ (quantum-resistant, one-time), SHA-256, merkle tree |
+| Mining              | CPU + optional wgpu GPU backend          |
+| Cryptography        | WOTS+ (PQ-safe, one-time), ML-KEM-512 stealth addresses |
 | Supply cap          | 84,000,000 LIT                          |
 | Codebase            | Rust, workspace of small crates         |
 | Platform            | Linux-first, portable                   |
+| RPC API             | HTTP JSON-RPC 2.0                       |
 
 ## Why a new coin?
 
@@ -34,21 +35,20 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the guiding principles, and
 
 ```
 litc/
-  Cargo.toml            # workspace; feature "gpu" enables OpenCL miner
-  config.toml.example
+  Cargo.toml            # workspace; feature "gpu" enables wgpu miner
   docs/                 # this documentation (English)
   crates/
-    litc-wire/          # ONE binary codec: Message, Serialize/Deserialize, Codec
-    litc-primitives/    # hash, merkle, WOTS+ keys/sign, block, tx
-    litc-store/         # traits BlockStore / ChainStore / UtxoStore (+ Memory/File)
-    litc-core/          # validation, utxo, mempool, difficulty, reorg, confirmations
-    litc-keystore/      # trait KeyStore: FileKeyStore (Ledger/Trezor later)
-    litc-wallet/        # wallet logic (no secrets); uses KeyStore + stores
-    litc-miner/         # trait MinerBackend; CpuMiner
-    litc-miner-gpu-wgpu/  # OPTIONAL, feature "gpu"
-    litc-node/          # node: wires core+store+miner+wire; local socket + (later) P2P
-    litc-cli/           # client: talks to node over litc-wire (binary) via socket/TCP
-    litc/               # binary: `litc node | wallet | mine | cli`
+    litc-wire           # binary codec: Message, Serialize/Deserialize
+    litc-primitives     # hash, merkle, WOTS+ keys/sign, block, tx
+    litc-store          # append-only block store + UTXO set
+    litc-core           # validation, utxo, mempool, difficulty, reorg
+    litc-keystore       # file-backed secret store
+    litc-wallet         # wallet logic (no secrets)
+    litc-miner          # CPU miner + BlockTemplate
+    litc-miner-gpu-wgpu # optional wgpu GPU mining backend
+    litc-node           # P2P node + RPC + miner driver
+    litc-cli            # command-line client
+    litc-ffi            # C API for embeddings / bindings
 ```
 
 ## Documentation
@@ -56,12 +56,13 @@ litc/
 - [PHILOSOPHY.md](PHILOSOPHY.md) — principles and the "one rule".
 - [specification.md](specification.md) — protocol parameters, with rationale.
 - [roadmap.md](roadmap.md) — implementation stages.
-- [rpc.md](rpc.md) — localhost RPC (first networking layer).
-- [protocol.md](protocol.md) — binary P2P wire format (added later).
-- [mining.md](mining.md) — algorithm, parameters, running on commodity hardware.
-- [pow.md](pow.md) — LiTC Proof-of-Work (LiteHash) design.
-- [wots.md](wots.md) — LiTC signatures: WOTS+ (quantum-resistant, one-time).
-- [benchmarks.md](benchmarks.md) — hardware measurements that fix the PoW params (LiteHash).
+- [rpc.md](rpc.md) — HTTP JSON-RPC API reference.
+- [protocol.md](protocol.md) — binary P2P wire format.
+- [mining.md](mining.md) — algorithm and commodity hardware.
+- [pow.md](pow.md) — LiteHash design.
+- [wots.md](wots.md) — WOTS+ signatures.
+- [benchmarks.md](benchmarks.md) — hardware measurements.
 - [running-a-node.md](running-a-node.md) — build, configure, run.
 - [wallet.md](wallet.md) — keys, backup, transfers.
+- [cli.md](cli.md) — node + CLI reference.
 - [reproducible-builds.md](reproducible-builds.md) — deterministic releases.

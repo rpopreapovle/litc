@@ -1,0 +1,122 @@
+LiTC — дорожная карта (open source → testnet → mainnet)
+========================================================
+
+Статус ядра: одноузловый демо-прототип. PoW+ретаргет, генезис,
+стелс-адреса PQ, FileStore с обрезкой, P2P-минимум, CLI+FFI — есть.
+
+
+#1 КРИТИЧНО для запуска сети из >1 узла (СДЕЛАНО)
+-------------------------------------------------
+[x] Реорги: откат/применение веток UTXO (disconnect/connect) — litc-core::reorganize.
+[x] Выбор цепи по cumulative work, а не по высоте (block_work + best_tip_by_work).
+[x] Блочный индекс: parent hash + cumulative work на блок (store.work / parent_of).
+[x] Undo-лог на блок (UndoData: created/spent/burnt) для отката.
+[x] set_tip -> reorganize() по work (node.accept_block делегирует litc_core::reorganize).
+[x] Тест: reorg_to_heavier_chain (ветка тяжелее переключает tip, UTXO корректно).
+[x] Персистентность: chainmeta.dat (work/applied/pow) + undo.dat — рестарт не ломает цепь.
+[ ] Ограничение: reorg вглубь старше in-memory undo (принятых за сессию
+    блоков); старые обрезанные блоки без тела не переприменяются.
+[ ] TODO: reorg на двух реальных узлах (A и B майнят расходящиеся цепи, тяжелая
+    переключает tip). Сделан только тест relay/синхронизации (B догнал A).
+[ ] TODO: retarget по best-цепи под reorg (сейчас приближённо через self.chain).
+
+
+#2 Глобальный testnet
+---------------------
+[~] Discovery узлов: addr gossip (GetAddr/Addr) + --connect/--seed + [node] seeds.
+    Узлы шлют свой listening-адрес в Version.from, gossip только listening-адреса
+    (больше нет подключений к эфемерным портам). DNS-сиды — отдельная задача.
+[~] Защита от DoS: лимит размера кадра MAX_FRAME=16MB в litc-wire::Codec::parse,
+    DoS-кап буфера в handle_conn, дедуп inv, handshake на Verack, таймаут
+    connect (5s). Нет ещё: banscore, rate-limit inv, капы числа входящих.
+[~] Загрузка блоков: GetBlocks(локатор=tip) + Inv + GetData + Block; первичная
+    синхронизация работает (проверено на двух узлах: B догнал A по высоте).
+    Ограничение: за один handshake ≤ MAX_SYNC_INV=2000 блоков; авто-повтор
+    GetBlocks после частичной синхи НЕ сделан (длинные цепи >2000 — потом).
+[ ] Внешний IP / NAT (слушаем на --listen, дефолт 127.0.0.1:port; для LAN
+    нужен реальный IP или UPnP — опционально).
+[ ] Инфраструктура: сид-ноды, кран (faucet), эксплорер, мониторинг.
+[ ] Тюнинг сложности под глобальную сеть (INITIAL_TARGET, EPOCH_BLOCKS).
+
+
+#3 Open source публикация (СДЕЛАНО 2026-07-14)
+---------------------------------------------
+[x] LICENSE (MIT), README (расширенный, статус + quick start + ссылки),
+    CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md.
+[x] CI: .github/workflows/ci.yml — fmt + clippy (-D warnings) + test
+    (Linux/macOS/Windows) + cargo-audit.
+[x] .gitignore (target/, *.dat, config.toml, wallet-файлы); git init; проверка
+    отсутствия секретов (ни одного секрета/приватного ключа в репозитории).
+[x] Демо-костыли задокументированы: убран устаревший комментарий "demo has no
+    difficulty adjustment" в litc-node; описание MemoryStore в litc-store
+    обновлено (есть и FileStore).
+[x] Cargo.lock зафиксирован; согласованные edition/license у всех крейтов
+    (litc-node и litc-miner-gpu-wgpu теперь наследуют workspace-поля).
+[x] FFI: добавлен include/litc.h (C-заголовок) и examples/example.c;
+    docs/ffi.md приведён в соответствие с актуальными сигнатурами
+    (агрегированный ephemeral, w=256 → WOTS_SIG=1152).
+[x] clippy --workspace --all-targets -- -D warnings и cargo fmt --check — чисто;
+    cargo test --locked --workspace — все тесты зелёные.
+
+
+#4 Mainnet (поверх testnet)
+---------------------------
+[ ] Полный PoW (убрать `small`), решить политику ASIC.
+[ ] Аудит криптографии (ML-KEM, WOTS+) и консенсуса + bug-bounty.
+[ ] Монетарная политика: халвинг, max supply, fee market, зрелость coinbase.
+[ ] Чекпоинты/финальность, механизм софт-форков и активаций (version bits).
+[ ] median-time-past, лимиты будущего времени, защита сложности.
+[ ] Ресурс-лимиты: max block/tx size, кап мемпула, оценка комиссий.
+[ ] Быстрая синхронизация (UTXO-snapshot / fast-sync).
+[ ] Кошелёк: HD-бэкап, coin-control, долгосрочная приватность.
+
+
+ПРИОРИТЕТНЫЙ ПОРЯДОК
+----------------------
+1. #1 (реорги + cumulative work) — иначе сеть из >1 узла не работает.
+2. #2 (discovery + DoS + загрузка блоков).
+3. #3 (инфраструктура testnet + open-source обвязка).
+4. #4 (mainnet: аудит, монетарка, чекпоинты).
+
+
+#5 АУДИТ БЕЗОПАСНОСТИ (проверено 2026-07-14)
+-------------------------------------------
+[~] Размер WOTS+ и блок-блот: подпись 2208 B (L=67, N=32), 1-in/2-out tx ≈2.3 KB,
+    stealth ≈3 KB. При 750 KB/15s → ~300 tx/блок, ~20 TPS. Полная история растёт
+    ~3 ГБ/день (~1.5 ТБ/год) — это норма для hash-based OTS (агрегации нет).
+     Слабые ноды спасает pruning (уже есть). Оптимизация: w=256 → сигна ≈1.1 KB
+     (L=34) СДЕЛАНО в #6 (см. ниже).
+[x] LiteHash TMTO — уязвимость БЫЛА: scratchpad заполнялся CTR-шифром (ChaCha8),
+    любой lane считался за O(1) из сида → ASIC мог пропустить 512 MB. ИСПРАВЛЕНО:
+    последовательная data-dependent заливка lane[i]=SHA256d(SHA256d(lane[i-1])‖seed)
+    (невозможно O(1) рекомпьют, линейный TMTO-трейдоф = memory-hard).
+[x] WOTS+ one-time reuse — консенсус уже реджектил burnt-ключи (validate_tx→is_burnt),
+    но кошелёк НЕ помнил неподтверждённые траты (двойная подпись до конфирма = утечка).
+    ИСПРАВЛЕНО: Wallet::spend_from/send_stealth/spend_stealth вызывают ensure_one_time
+    (отказ если commit burnt ИЛИ в persisted used-сете <wallet>.used) и mark_one_time
+    после подписи. Защита на уровне типов + БД.
+
+
+#6 ВЕС НОД / БЛОК-БЛОТ (реализуем сейчас, до запуска testnet)
+------------------------------------------------------------
+Контекст: доминирующий вес истории — WOTS+ сигнатуры (~95% tx). UTXO-сет и
+txid — мизер. Utreexo (идея 1) и стирание сигнатур (идея 2) ОТЛОЖЕНЫ:
+- Utreexo: только light/sub-light клиент «без диска»; полная нода всё равно
+  хранит лес ~32B/UTXO; большой проект + консенсус-чейндж → в #4 (mainnet).
+- Стирание сигнатур: ломает verify-from-genesis (новая нода доверяет UTXO-root)
+  → только как assumevalid/checkpoint для глубокой истории в #4. Не для testnet.
+- Relative pointers (идея 3a): экономит ~24B/input (<2% tx) — НЕ делать.
+
+[x] w=256 (главный рычаг, 2× меньше история): W:16→256, L1:64→32, L2:3→2,
+     L:67→34, сигнатура 2208→1152 B. msg_digits/чек-сумма под base-256
+     (generic over W). Плата: ~8× хешей на sign/verify (CPU). Консенсус-чейндж
+     (генезис перемайнится). FFI litc_wots_sig_len=(2+L)*N подхватит автоматом.
+     Тесты проходят.
+[x] Агрегированный ephemeral (идея 3b): один KEM-ciphertext (768B) на tx вместо
+     на каждый stealth-выхлоп; пер-выхлоп ключ деривируется как H(SS‖output_index).
+     Tx-формат: tx-level Transaction.ephemeral (консенсус-чейндж). UtxoStore::add_utxo
+     принимает ephemeral, iter_utxos возвращает (OutPoint, TxOut, Vec<u8>); utxo.dat
+     персистит его. wallet send_stealth инкапсулирует один раз и ставит tx.ephemeral;
+     scan_chain восстанавливает ключ через recover_stealth_keypair_at(sk, ct, index).
+     FFI litc_stealth_build_output возвращает (TxOut, ct), litc_stealth_commit/sign
+     принимают index. Все тесты проходят. docs/stealth.md обновлён.

@@ -9,14 +9,43 @@
 //!   3. the commitment has not been spent before (WOTS+ one-time use).
 
 use litc_primitives::{
-    sha256d, to_bytes, wots, Amount, Block, BlockHeader, Hash32, OutPoint, Transaction, TxIn, TxOut,
+    sha256d, to_bytes, wots, Amount, Block, BlockHeader, Hash32, OutPoint, SignatureScheme,
+    Transaction, TxIn, TxOut,
 };
+use litc_primitives::chainparams::ChainParams;
 use litc_pow::EPOCH_BLOCKS;
+use litc_store::state::{OverlayState, StateStore, UtxoEntry};
 use litc_store::SpendStore;
 use std::collections::HashSet;
 
-/// Block subsidy (newly minted value per coinbase, in satoshis of 1e-8 LIT).
-pub const SUBSIDY: Amount = Amount(50 * 100_000_000);
+/// Consensus state abstraction (trait + in-memory implementations). Lives in
+/// `litc-store` to avoid a dependency cycle; re-exported here for convenience.
+pub use litc_store::state;
+
+/// Initial block reward, before any halving. 5 LIT.
+pub const BASE_SUBSIDY: Amount = Amount(5 * 100_000_000);
+/// Blocks between subsidy halvings (~4 years at 15 s blocks).
+pub const HALVING_INTERVAL: u64 = 8_400_000;
+/// Block reward at `height`: `BASE_SUBSIDY` right-shifted by the halving epoch.
+/// Halves every `HALVING_INTERVAL` blocks; once the epoch exceeds the bit-width
+/// of the subsidy it reaches 0, so total issuance converges to
+/// `BASE_SUBSIDY * HALVING_INTERVAL * 2 = 84,000,000 LIT` (the supply cap) and no
+/// separate cap check is needed.
+pub fn block_subsidy(height: u64) -> Amount {
+    block_subsidy_with(height, HALVING_INTERVAL)
+}
+
+/// Block reward at `height` for a network with the given `halving_interval`.
+/// Testnet compresses mainnet's 8,400,000-block interval to 10,000 so emission
+/// is observable quickly; the geometric-sum supply cap still holds (the total
+/// issued converges to `BASE_SUBSIDY * halving_interval * 2`).
+pub fn block_subsidy_with(height: u64, halving_interval: u64) -> Amount {
+    let epoch = height / halving_interval;
+    if epoch >= 64 {
+        return Amount(0);
+    }
+    Amount(BASE_SUBSIDY.0 >> epoch)
+}
 
 /// A coinbase output cannot be spent until this many blocks have been mined on
 /// top of the block that created it. Prevents a deep reorg from instantly
@@ -64,7 +93,7 @@ pub fn sighash(tx: &Transaction, input_index: usize, prev_script: &[u8]) -> [u8;
 ///
 /// `spend_height` is the height of the block that will contain this
 /// transaction; it is used to enforce the coinbase-maturity rule.
-pub fn validate_tx<S: SpendStore>(
+pub fn validate_tx<S: StateStore>(
     tx: &Transaction,
     store: &S,
     spend_height: u64,
@@ -75,31 +104,41 @@ pub fn validate_tx<S: SpendStore>(
     let mut sum_in: u64 = 0;
     for (idx, inp) in tx.inputs.iter().enumerate() {
         let prev = store
-            .utxo(&inp.prevout)
-            .ok_or_else(|| "input not found or already spent".to_string())?
-            .clone();
-        if prev.script_pubkey.len() != 20 {
+            .get_utxo(&inp.prevout)
+            .ok_or_else(|| "input not found or already spent".to_string())?;
+        if prev.output.script_pubkey.len() != 20 {
             return Err("bad script_pubkey: need 20-byte HASH160(R)".into());
         }
-        let commit: [u8; 20] = prev.script_pubkey[..20].try_into().unwrap();
-        if store.is_burnt(&commit) {
+        let commit: [u8; 20] = prev.output.script_pubkey[..20].try_into().unwrap();
+        if store.get_burnt(&commit) {
             return Err("address already spent (WOTS+ one-time)".into());
         }
         // Coinbase maturity: a coinbase output may only be spent after
         // `COINBASE_MATURITY` blocks have been mined on top of its block.
-        if let Some(h) = store.coinbase_height(&inp.prevout) {
+        if let Some(h) = prev.coinbase_height {
             if spend_height < h + COINBASE_MATURITY {
                 return Err("coinbase output is not mature yet".into());
             }
         }
-        let witness = wots::decode_witness(&inp.script_sig)
-            .map_err(|_| "cannot decode WOTS+ witness".to_string())?;
-        let msg = sighash(tx, idx, &prev.script_pubkey);
-        if !witness.verify(&msg, &commit) {
-            return Err("WOTS+ signature invalid".into());
+        let msg = sighash(tx, idx, &prev.output.script_pubkey);
+        match inp.scheme {
+            SignatureScheme::Wots256 => {
+                let witness = wots::decode_witness(&inp.script_sig)
+                    .map_err(|_| "cannot decode WOTS+ witness".to_string())?;
+                if !witness.verify(&msg, &commit) {
+                    return Err("WOTS+ signature invalid".into());
+                }
+            }
+            SignatureScheme::Unknown => {
+                return Err("unknown signature scheme".into());
+            }
+            _ => {
+                // Reserved1..3: recognized but not yet active.
+                return Err("reserved signature scheme not yet active".into());
+            }
         }
         sum_in = sum_in
-            .checked_add(prev.value.0)
+            .checked_add(prev.output.value.0)
             .ok_or_else(|| "input value overflow".to_string())?;
     }
     let sum_out: u64 = tx.outputs.iter().map(|o| o.value.0).sum();
@@ -147,12 +186,30 @@ pub fn validate_block_header<S: SpendStore>(
     Ok(())
 }
 
+/// Enforce a checkpoint for `block`, if its height is a configured checkpoint.
+/// A checkpoint irreversibly pins a (height, hash) pair: any block at that
+/// height whose hash differs is rejected, which finalizes history at and below
+/// the checkpoint and bounds the trust placed in a fast-sync snapshot (see
+/// `docs/state.md`). With an empty checkpoint list (e.g. a brand-new testnet)
+/// this is a no-op.
+pub fn validate_checkpoint(block: &Block, params: &ChainParams) -> Result<(), String> {
+    if let Some(expected) = params.checkpoint_hash(block.header.height) {
+        if block.block_hash() != expected {
+            return Err(format!(
+                "checkpoint mismatch at height {}: block hash does not match the pinned checkpoint",
+                block.header.height
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Block-level value validation (pure). Enforces:
 ///   - exactly one coinbase, and it is the first transaction,
 ///   - no intra-block double spend,
 ///   - `sum(outputs) <= sum(inputs)` for every spend (delegated to `validate_tx`),
-///   - coinbase value `<= SUBSIDY + total_fees`.
-pub fn validate_block_value<S: SpendStore>(
+///   - coinbase value `<= block_subsidy(height) + total_fees`.
+pub fn validate_block_value<S: StateStore>(
     block: &Block,
     store: &S,
 ) -> Result<(), String> {
@@ -188,7 +245,7 @@ pub fn validate_block_value<S: SpendStore>(
     if let Some(cb) = block.txs.first() {
         if cb.inputs.is_empty() {
             let out: u64 = cb.outputs.iter().map(|o| o.value.0).sum();
-            let max_allowed = SUBSIDY
+            let max_allowed = block_subsidy(block.header.height)
                 .0
                 .checked_add(sum_fees)
                 .ok_or_else(|| "subsidy overflow".to_string())?;
@@ -204,7 +261,7 @@ pub fn validate_block_value<S: SpendStore>(
 /// burning the spent keys. Callers must have already passed `validate_tx`
 /// (which guarantees every input exists and is unburnt), so this cannot fail
 /// under normal conditions.
-fn apply_tx<S: SpendStore>(
+fn apply_tx<S: StateStore>(
     tx: &Transaction,
     store: &mut S,
     height: u64,
@@ -212,25 +269,37 @@ fn apply_tx<S: SpendStore>(
 ) -> Result<(), String> {
     for inp in &tx.inputs {
         let prev = store
-            .utxo(&inp.prevout)
+            .get_utxo(&inp.prevout)
             .ok_or_else(|| "input not found or already spent".to_string())?
             .clone();
-        if prev.script_pubkey.len() != 20 {
+        if prev.output.script_pubkey.len() != 20 {
             return Err("bad script_pubkey: need 20-byte HASH160(R)".into());
         }
-        let commit: [u8; 20] = prev.script_pubkey[..20].try_into().unwrap();
-        store.spend_utxo(&inp.prevout)?;
-        store.mark_spent_once(&commit)?;
+        let commit: [u8; 20] = prev.output.script_pubkey[..20].try_into().unwrap();
+        store.remove_utxo(&inp.prevout);
+        store.mark_burnt(commit);
     }
     for (i, out) in tx.outputs.iter().enumerate() {
         let op = OutPoint {
             txid: tx.txid(),
             index: i as u32,
         };
-        store.add_utxo(op.clone(), out.clone(), tx.ephemeral.clone());
-        if is_coinbase {
-            store.mark_coinbase(&op, height);
-        }
+        store.put_utxo(
+            op.clone(),
+            UtxoEntry {
+                output: TxOut {
+                    value: out.value,
+                    script_pubkey: out.script_pubkey.clone(),
+                    // The KEM ciphertext is carried at the transaction level
+                    // (`tx.ephemeral`) and shared by all of the transaction's
+                    // outputs. Store it on each UTXO so the recipient can scan
+                    // and recover the one-time WOTS+ key (and so it is included
+                    // in the committed `state_root`).
+                    ephemeral: tx.ephemeral.clone(),
+                },
+                coinbase_height: if is_coinbase { Some(height) } else { None },
+            },
+        );
     }
     Ok(())
 }
@@ -255,7 +324,7 @@ pub fn check_pow(header: &BlockHeader, target: &[u8; 32]) -> bool {
 
 /// Validate a block, then apply it: check PoW and merkle root, validate every
 /// transaction, spend inputs, add outputs, record the block and advance tip.
-pub fn connect_block<S: SpendStore>(
+pub fn connect_block<S: SpendStore + StateStore>(
     block: &Block,
     store: &mut S,
     target: &[u8; 32],
@@ -286,18 +355,48 @@ pub fn validate_block_pow_merkle(block: &Block, target: &[u8; 32]) -> bool {
 /// `UndoData` is never even created. Does not check PoW (callers validate PoW
 /// once, at first sight, via `remember_pow`) and does not set the tip — chain
 /// selection is the node's job.
-pub fn apply_block<S: SpendStore>(store: &mut S, block: &Block) -> Result<(), String> {
+pub fn apply_block<S: SpendStore + StateStore>(store: &mut S, block: &Block) -> Result<(), String> {
     // Pure validation first — no side effects, so a rejected block cannot
     // partially corrupt the UTXO set.
     validate_block_header(block, store)?;
     validate_block_value(block, store)?;
+
+    // State-root check (read-only via an overlay; the base is left untouched on
+    // a mismatch, so no rollback is needed). A zero `state_root` means "not set"
+    // (legacy/test blocks) and is accepted without verification.
+    if block.header.state_root != Hash32([0u8; 32]) {
+        let mut ov = OverlayState::new(store);
+        for tx in block.txs.iter() {
+            apply_tx(tx, &mut ov, block.header.height, tx.inputs.is_empty())?;
+        }
+        if ov.root() != block.header.state_root.0 {
+            return Err("state root mismatch".into());
+        }
+        // `ov` is dropped here; the base store remains unmodified.
+    }
+
     store.begin_block(block.block_hash());
-    for (i, tx) in block.txs.iter().enumerate() {
-        apply_tx(tx, store, block.header.height, i == 0)?;
+    for tx in block.txs.iter() {
+        apply_tx(tx, store, block.header.height, tx.inputs.is_empty())?;
     }
     store.end_block();
     store.put_block(block)?;
     Ok(())
+}
+
+/// Compute the `state_root` that results from applying `block` to the current
+/// state, without mutating it. The block template's `state_root` (and the mined
+/// header's) is set to this value before mining, so the PoW binds the work to
+/// the resulting state and a bootstrapping node can verify it trustlessly.
+pub fn block_state_root<S: SpendStore + StateStore>(
+    store: &mut S,
+    block: &Block,
+) -> Result<[u8; 32], String> {
+    let mut ov = OverlayState::new(store);
+    for tx in block.txs.iter() {
+        apply_tx(tx, &mut ov, block.header.height, tx.inputs.is_empty())?;
+    }
+    Ok(ov.root())
 }
 
 /// Lowest common ancestor of two blocks (the shared block nearest `b`'s tip),
@@ -347,7 +446,7 @@ pub fn path_to<S: SpendStore>(
 /// Rolls back the current tip to the common ancestor, then connects the new
 /// branch. UTXO changes are reversed via each block's `UndoData`. The caller
 /// is responsible for having validated PoW and recorded each block's `work`.
-pub fn reorganize<S: SpendStore>(store: &mut S) {
+pub fn reorganize<S: SpendStore + StateStore>(store: &mut S) {
     let new_tip = match store.best_tip_by_work() {
         Some(h) => h,
         None => return,
@@ -377,7 +476,7 @@ pub fn reorganize<S: SpendStore>(store: &mut S) {
 }
 
 /// Connect every block on the path from `ancestor`'s child up to `tip`.
-fn connect_branch<S: SpendStore>(store: &mut S, tip: Hash32, ancestor: Option<Hash32>) {
+fn connect_branch<S: SpendStore + StateStore>(store: &mut S, tip: Hash32, ancestor: Option<Hash32>) {
     for bhash in path_to(store, tip, ancestor) {
         if !store.is_applied(&bhash) {
             if let Some(block) = store.get_block(&bhash) {
@@ -426,6 +525,7 @@ pub fn coinbase(commit: [u8; 20], value: Amount, height: u64) -> (Block, OutPoin
             version: 1,
             prev_block: Hash32([0u8; 32]),
             merkle_root: Hash32([0u8; 32]),
+            state_root: Hash32([0u8; 32]),
             timestamp: 0,
             height,
             epoch_seed: Hash32([0u8; 32]),
@@ -449,6 +549,7 @@ pub fn spend(
         version: 1,
         inputs: vec![TxIn {
             prevout: prev,
+            scheme: SignatureScheme::Wots256,
             script_sig: vec![],
             sequence: 0xFFFF_FFFF,
         }],
@@ -497,7 +598,7 @@ mod tests {
         let mut store = MemoryStore::new();
 
         // Genesis (height 0), applied.
-        let (g, _) = coinbase([1u8; 20], Amount(50 * 100_000_000), 0);
+        let (g, _) = coinbase([1u8; 20], Amount(5 * 100_000_000), 0);
         store.put_block(&g).unwrap();
         store.set_work(g.block_hash(), 10);
         apply_block(&mut store, &g).unwrap();
@@ -508,12 +609,12 @@ mod tests {
         let a1 = block(
             g.block_hash(),
             1,
-            vec![cb([2u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([2u8; 20], Amount(5 * 100_000_000))],
         );
         let a2 = block(
             a1.block_hash(),
             2,
-            vec![cb([3u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([3u8; 20], Amount(5 * 100_000_000))],
         );
         for b in [&a1, &a2] {
             store.put_block(b).unwrap();
@@ -522,23 +623,23 @@ mod tests {
             store.set_work(b.block_hash(), 10 * (b.header.height as u128));
         }
         store.set_tip(a2.block_hash(), 2);
-        assert_eq!(store.iter_utxos().len(), 3); // g + a1 + a2
+        assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), 3); // g + a1 + a2
 
         // Chain B: B1, B2, B3 — not yet applied, but heavier (work 90).
         let b1 = block(
             g.block_hash(),
             1,
-            vec![cb([4u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([4u8; 20], Amount(5 * 100_000_000))],
         );
         let b2 = block(
             b1.block_hash(),
             2,
-            vec![cb([5u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([5u8; 20], Amount(5 * 100_000_000))],
         );
         let b3 = block(
             b2.block_hash(),
             3,
-            vec![cb([6u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([6u8; 20], Amount(5 * 100_000_000))],
         );
         for b in [&b1, &b2, &b3] {
             store.put_block(b).unwrap();
@@ -551,15 +652,15 @@ mod tests {
         assert!(store.is_applied(&b3.block_hash()));
         assert!(!store.is_applied(&a2.block_hash()));
         // UTXO set reflects chain B: g + b1 + b2 + b3 = 4 coinbases.
-        assert_eq!(store.iter_utxos().len(), 4);
-        let bal: u64 = store.iter_utxos().iter().map(|(_, o, _)| o.value.0).sum();
-        assert_eq!(bal, 4 * 50 * 100_000_000);
+        assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), 4);
+        let bal: u64 = litc_store::UtxoStore::iter_utxos(&store).iter().map(|(_, o, _)| o.value.0).sum();
+        assert_eq!(bal, 4 * 5 * 100_000_000);
 
         // A weaker fork must NOT trigger a reorg.
         let c1 = block(
             g.block_hash(),
             1,
-            vec![cb([7u8; 20], Amount(50 * 100_000_000))],
+            vec![cb([7u8; 20], Amount(5 * 100_000_000))],
         );
         store.put_block(&c1).unwrap();
         store.set_work(c1.block_hash(), 1); // tiny work
@@ -574,6 +675,7 @@ mod tests {
                 version: 1,
                 prev_block: prev,
                 merkle_root: Hash32([0u8; 32]),
+                state_root: Hash32([0u8; 32]),
                 timestamp: height,
                 height,
                 epoch_seed: Hash32([0u8; 32]),
@@ -593,7 +695,7 @@ mod tests {
             let b = block(
                 prev,
                 h,
-                vec![cb([h as u8; 20], Amount(50 * 100_000_000))],
+                vec![cb([h as u8; 20], Amount(5 * 100_000_000))],
             );
             apply_block(store, &b).unwrap();
             prev = b.block_hash();
@@ -605,7 +707,7 @@ mod tests {
     fn coinbase_then_spend_ok() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         apply_block(&mut store, &blk).unwrap();
 
@@ -614,7 +716,7 @@ mod tests {
 
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
-        let tx = spend(&kp, op, &commit, Amount(49 * 100_000_000), to);
+        let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, COINBASE_MATURITY + 1, vec![tx]);
         apply_block(&mut store, &spend_block).unwrap();
         assert!(store.burnt().is_burnt(&commit));
@@ -624,14 +726,14 @@ mod tests {
     fn coinbase_immature_spend_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         apply_block(&mut store, &blk).unwrap();
         // Spend at height 1: the genesis coinbase (height 0) is not mature.
         let tip = extend(&mut store, blk.block_hash(), 1);
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
-        let tx = spend(&kp, op, &commit, Amount(49 * 100_000_000), to);
+        let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, 2, vec![tx]);
         // `apply_block` validates the block, which rejects the immature spend.
         assert!(apply_block(&mut store, &spend_block).is_err());
@@ -641,7 +743,7 @@ mod tests {
     fn one_time_reuse_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         apply_block(&mut store, &blk).unwrap();
 
@@ -650,7 +752,7 @@ mod tests {
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
         // First spend of the address (burns `commit`).
-        let first = spend(&kp, op.clone(), &commit, Amount(49 * 100_000_000), to);
+        let first = spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         apply_block(
             &mut store,
             &block(tip, COINBASE_MATURITY + 1, vec![first]),
@@ -663,7 +765,7 @@ mod tests {
         let mut store2 = MemoryStore::new();
         apply_block(&mut store2, &blk).unwrap();
         let tip2 = extend(&mut store2, blk.block_hash(), COINBASE_MATURITY);
-        let first2 = spend(&kp, op.clone(), &commit, Amount(49 * 100_000_000), to);
+        let first2 = spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         apply_block(
             &mut store2,
             &block(tip2, COINBASE_MATURITY + 1, vec![first2]),
@@ -676,7 +778,7 @@ mod tests {
                 index: 0,
             },
             TxOut {
-                value: Amount(50 * 100_000_000),
+                value: Amount(5 * 100_000_000),
                 script_pubkey: commit.to_vec(),
                 ephemeral: vec![],
             },
@@ -689,7 +791,7 @@ mod tests {
                 index: 0,
             },
             &commit,
-            Amount(49 * 100_000_000),
+            Amount(4 * 100_000_000),
             to,
         );
         assert!(validate_tx(&bad_tx, &store2, 1_000_000).is_err());
@@ -699,13 +801,13 @@ mod tests {
     fn bad_signature_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
         let rogue = wots::WotsKeypair::derive(&[0x99u8; 32], 0);
         let to = rogue.pubkey_root_hash160();
-        let mut tx = spend(&rogue, op, &commit, Amount(49 * 100_000_000), to);
+        let mut tx = spend(&rogue, op, &commit, Amount(4 * 100_000_000), to);
         let msg = sighash(&tx, 0, &commit);
         tx.inputs[0].script_sig = wots::encode_witness(&rogue.sign(&msg));
         let b = block(blk.block_hash(), 1, vec![tx]);
@@ -716,10 +818,116 @@ mod tests {
     fn merkle_mismatch_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (mut blk, _) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (mut blk, _) = coinbase(commit, Amount(5 * 100_000_000), 0);
         blk.header.merkle_root = Hash32([7u8; 32]); // wrong
         let mut store = MemoryStore::new();
         assert!(connect_block(&blk, &mut store, &EASY).is_err());
+    }
+
+    /// CRITICAL FIX #5 (StateRoot): a block whose `state_root` does not match the
+    /// post-apply UTXO/BurntKeys state is rejected, while the correct root is
+    /// accepted. The header commits to the state, so a pruned/stateless node can
+    /// verify a block without the full history.
+    #[test]
+    fn state_root_enforced() {
+        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_root_hash160();
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
+        let mut store = MemoryStore::new();
+        connect_block(&blk, &mut store, &EASY).unwrap();
+
+        // Mature the genesis coinbase, then build a legitimate spend.
+        let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
+        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_root_hash160();
+        let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
+        let b = block(tip, COINBASE_MATURITY + 1, vec![tx]);
+
+        // Compute the state root that results from applying `b` (via a read-only
+        // overlay, so the store is untouched).
+        let root = block_state_root(&mut store, &b).unwrap();
+
+        let mut good = b.clone();
+        good.header.state_root = Hash32(root);
+        assert!(connect_block(&good, &mut store, &EASY).is_ok());
+
+        let mut bad = b.clone();
+        bad.header.state_root = Hash32([0xABu8; 32]); // wrong, non-zero
+        assert!(connect_block(&bad, &mut store, &EASY).is_err());
+    }
+
+    /// CRITICAL FIX #6 (checkpoints): a block at a checkpoint height must carry
+    /// the pinned hash. This finalizes history at/below the checkpoint and
+    /// bounds fast-sync snapshot trust (see `docs/state.md`). With no matching
+    /// checkpoint the block is unaffected.
+    #[test]
+    fn checkpoint_enforced() {
+        let blk = block(Hash32([0u8; 32]), 0, vec![]);
+        let h = blk.block_hash();
+
+        // No checkpoint at height 0 -> accepted.
+        let none = ChainParams::testnet();
+        assert!(validate_checkpoint(&blk, &none).is_ok());
+
+        // A checkpoint at height 0 with the *correct* hash -> accepted.
+        let mut good = ChainParams::testnet();
+        good.checkpoints = vec![(0, h.0)];
+        assert!(validate_checkpoint(&blk, &good).is_ok());
+
+        // A checkpoint at height 0 with a *wrong* hash -> rejected.
+        let mut wrong = ChainParams::testnet();
+        wrong.checkpoints = vec![(0, [0x99u8; 32])];
+        assert!(validate_checkpoint(&blk, &wrong).is_err());
+    }
+
+    /// CRITICAL FIX #5 (SignatureScheme): an input must declare an *active*
+    /// signature scheme. Reserved ids (future post-quantum / hybrid schemes)
+    /// are recognized but not yet active, and any unknown id is rejected —
+    /// even when the WOTS+ signature itself is perfectly valid.
+    #[test]
+    fn reserved_signature_scheme_rejected() {
+        let mut store = MemoryStore::new();
+        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_root_hash160();
+        let op = OutPoint {
+            txid: Hash32([1u8; 32]),
+            index: 0,
+        };
+        store.add_utxo(
+            op.clone(),
+            TxOut {
+                value: Amount(5 * 100_000_000),
+                script_pubkey: commit.to_vec(),
+                ephemeral: vec![],
+            },
+            vec![],
+        );
+        let make_tx = |scheme: SignatureScheme| -> Transaction {
+            let mut tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prevout: op.clone(),
+                    scheme,
+                    script_sig: vec![],
+                    sequence: 0xFFFF_FFFF,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount(1),
+                    script_pubkey: vec![0u8; 20],
+                    ephemeral: vec![],
+                }],
+                ephemeral: vec![],
+                lock_time: 0,
+            };
+            // Sign over the sighash that *includes* the scheme byte, so a
+            // Wots256 tx verifies while the others are rejected by dispatch.
+            let msg = sighash(&tx, 0, &commit);
+            tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
+            tx
+        };
+        assert!(validate_tx(&make_tx(SignatureScheme::Reserved1), &store, 1).is_err());
+        assert!(validate_tx(&make_tx(SignatureScheme::Unknown), &store, 1).is_err());
+        assert!(validate_tx(&make_tx(SignatureScheme::Wots256), &store, 1).is_ok());
     }
 
     /// Helper: a signed spend of `prev` paying `value` to `to`, with a valid
@@ -736,6 +944,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prevout: prev,
+                scheme: SignatureScheme::Wots256,
                 script_sig: vec![],
                 sequence: 0xFFFF_FFFF,
             }],
@@ -758,19 +967,19 @@ mod tests {
     fn inflation_via_outputs_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
-        // Pay out 51 LIT while only owning 50 LIT.
+        // Pay out 51 LIT while only owning 5 LIT.
         let tx = signed_spend(&kp, op.clone(), &commit, Amount(51 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![tx]);
         assert!(connect_block(&b, &mut store, &EASY).is_err());
     }
 
-    /// CRITICAL FIX #1: a coinbase may mint at most SUBSIDY (+ fees). Minting
+    /// CRITICAL FIX #1: a coinbase may mint at most block_subsidy(height) (+ fees). Minting
     /// more is rejected.
     #[test]
     fn inflated_coinbase_rejected() {
@@ -782,11 +991,11 @@ mod tests {
     /// A block may contain exactly one coinbase, and it must be first.
     #[test]
     fn two_coinbases_rejected() {
-        let (g, _) = coinbase([0u8; 20], Amount(50 * 100_000_000), 0);
+        let (g, _) = coinbase([0u8; 20], Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&g, &mut store, &EASY).unwrap();
-        let cb1 = cb([1u8; 20], Amount(50 * 100_000_000));
-        let cb2 = cb([2u8; 20], Amount(50 * 100_000_000));
+        let cb1 = cb([1u8; 20], Amount(5 * 100_000_000));
+        let cb2 = cb([2u8; 20], Amount(5 * 100_000_000));
         let b = block(g.block_hash(), 1, vec![cb1, cb2]);
         assert!(connect_block(&b, &mut store, &EASY).is_err());
     }
@@ -798,15 +1007,15 @@ mod tests {
     fn partial_apply_rolls_back() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
-        let before = store.iter_utxos().len();
+        let before = litc_store::UtxoStore::iter_utxos(&store).len();
 
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
         // Tx 0: valid spend of `op` (would consume it on apply).
-        let good = signed_spend(&kp, op.clone(), &commit, Amount(49 * 100_000_000), to);
+        let good = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         // Tx 1: a coinbase that is not first -> rejected at block validation.
         let bad = Transaction {
             version: 1,
@@ -823,7 +1032,7 @@ mod tests {
         assert!(connect_block(&b, &mut store, &EASY).is_err());
 
         // Nothing changed: `op` still unspent, count and tip unchanged.
-        assert_eq!(store.iter_utxos().len(), before);
+        assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), before);
         assert!(store.utxo(&op).is_some());
         assert_eq!(store.tip(), Some(blk.block_hash()));
     }
@@ -834,14 +1043,14 @@ mod tests {
     fn intra_block_double_spend_rejected() {
         let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
         let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(50 * 100_000_000), 0);
+        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
         let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_root_hash160();
-        let a = signed_spend(&kp, op.clone(), &commit, Amount(10 * 100_000_000), to);
-        let b_tx = signed_spend(&kp, op.clone(), &commit, Amount(10 * 100_000_000), to);
+        let a = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
+        let b_tx = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![a, b_tx]);
         assert!(connect_block(&b, &mut store, &EASY).is_err());
     }

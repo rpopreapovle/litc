@@ -62,14 +62,16 @@ RTX 3060. Lock LiteHash `N` (512 MB), `W` (walk length) and
 `EPOCH_BLOCKS` so commodity hardware stays competitive. Confirm CPU and
 GPU land close; pick on measured fairness, not habit.
 
-## Stage 10 — P2P (binary, minimal, decentralized)
-`litc-p2p`: TCP reusing `litc-wire` — `version, verack, inv, getdata, tx,
-block, ping, pong, getaddr, addr`. `getaddr`/`addr` give peer discovery with no
-hardcoded seeds. **Compact-block relay** (short tx IDs, BIP152-style) is required
-so 750 KB blocks propagate fast at 15 s cadence. No JSON.
+## Stage 10 — P2P (binary, minimal, decentralized) — **DONE**
+Delivered in `litc-node` (TCP, reusing `litc-wire`) rather than a separate
+`litc-p2p` crate: `version, verack, inv, getdata, tx, block, ping, pong,
+getaddr, addr` plus the local RPC frames. Handshake, inventory relay, rate
+limits, and address gossip with no hardcoded seeds. **Compact-block relay**
+(short tx IDs, BIP152-style) is the planned fast path; full `block` is the
+current fallback. No JSON.
 
 ## Stage 11 — GPU miner (optional)
-`litc-miner-gpu-opencl` behind `gpu` feature. Verified on GTX 650.
+`litc-miner-gpu-wgpu` behind `gpu` feature. Verified on RTX 3060 (Vulkan).
 
 ## Stage 12 — Docs + reproducible builds
 Complete `docs/`; `cargo build --locked` yields deterministic releases.
@@ -80,8 +82,54 @@ any FFI-capable language). The reusable stealth-address scheme is documented in
 `docs/stealth.md`; the WOTS+ reuse strategy in `docs/wots.md`.
 
 ## Definition of Done (MVP testnet)
-- `cargo build --locked` works without OpenCL; `--features gpu` adds GPU miner.
+- `cargo build --locked` works without GPU deps; `--features gpu` adds wgpu GPU miner.
 - `cargo test` runs the 2-node tx/mine/reorg scenario automatically.
 - Transfers confirm in <20 s, fees low, config TOML, PHILOSOPHY exists, spec
   open and justified, one binary format everywhere.
 - LiteHash parameters are benchmark-backed.
+
+## Session 2026-07-15 — consensus hardening (all DONE)
+
+The following were added on top of the MVP and are documented in
+[specification.md](specification.md), [state.md](state.md), and [wots.md](wots.md).
+
+### Stage 13 — Consensus state commitment (state_root + SMT)
+Block header carries `state_root = SHA-256d(utxo_root || burnt_root)`, where
+both roots are Sparse Merkle Trees. A bootstrapping node verifies the root by
+applying each block over a read-only overlay and recomputing it, so the PoW
+secures the resulting state, not just transitions. See [state.md](state.md).
+
+### Stage 14 — Signature-scheme agility (SignatureScheme)
+Every `TxIn` declares `scheme: SignatureScheme` (`Wots256` active at launch;
+`Reserved1..3` recognized-but-inactive; `Unknown` rejected). `validate_tx`
+dispatches per scheme; the scheme byte is part of the sighash, binding each
+signature to its scheme. Reserved ids leave room for future post-quantum /
+hybrid schemes without a flag-day fork.
+
+### Stage 15 — Snapshot + fast-sync
+`FileStore::save_snapshot` / `load_snapshot` let a node bootstrap from a
+trusted state snapshot (UTXO + burnt + tip block) instead of replaying from
+genesis. Loading is trustless: the stored `state_root` is recomputed and a
+mismatch (tampering) is rejected. Versioned format (`magic "LITS"`, `version`)
+with a tamper-detection test. Node CLI: `--archive`, `--verify-from-genesis`,
+`--fast-sync <dir>`, `--save-snapshot <dir>`.
+
+### Stage 16 — Network parameters, genesis pinning, checkpoints
+`litc-primitives::chainparams`: `Network{Mainnet,Testnet}` + `ChainParams`
+(`magic`, `halving_interval`, `genesis_hash`, `checkpoints`). The node picks
+the network via `--network` / `LITC_NETWORK`. A block at a checkpoint height
+must carry the pinned hash (`validate_checkpoint`), which finalizes history
+at/below it and **bounds fast-sync trust** — a snapshot is only accepted if its
+tip matches the highest checkpoint at or below its height. The genesis hash is
+pinned as a checkpoint at testnet launch.
+
+### Next (not yet done)
+- **Stage 17 — Fast-sync end-to-end test**: mine a chain, snapshot, start a
+  fresh node from the snapshot, confirm it catches up. (unit test exists;
+  node-level e2e pending)
+- **Stage 18 — P2P smoke / 2-node sync test** and **compact-block relay**.
+  - `p2p_handshake_and_block_relay` unit test now covers handshake + `inv`/
+    `getdata`/block relay over loopback TCP (DONE).
+- **Stage 19 — Throughput benchmark** for WOTS+ `w=256` (already active) and
+  tx/s under block validation. WOTS+ witness/throughput numbers added to
+  `docs/benchmarks.md` (DONE).
