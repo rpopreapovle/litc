@@ -5,25 +5,20 @@ LiTC commits to its **entire consensus state** in every block header via the
 a node that has discarded old blocks can still verify a new block trustlessly,
 because the header binds the work (Proof-of-Work) to the resulting UTXO set.
 
-The `state_root` is a **pure function** of two sets:
-
-- the live **UTXO set** (every unspent output), and
-- the set of **burnt WOTS+ commitments** (one-time keys that have been spent,
-  so they can never be reused).
+The `state_root` is a **pure function** of the live **UTXO set** (every
+unspent output).
 
 ## Definition
 
 ```
-state_root = SHA256( utxo_root || burnt_root )
+state_root = SHA256( utxo_root )
 ```
 
-where `utxo_root` and `burnt_root` are the roots of independent **Sparse
-Merkle Trees (SMT)** over:
+where `utxo_root` is the root of a **Sparse Merkle Tree (SMT)** over:
 
 | tree        | key                                   | value                     |
 |-------------|---------------------------------------|---------------------------|
 | `utxo_root` | `H(txid || output_index)`             | canonical UTXO leaf       |
-| `burnt_root`| `H(burnt commitment)`                 | empty (presence only)     |
 
 The SMT is **deterministic** and **order-independent**: the root depends only
 on the set of (key, value) pairs, never on the order in which they were
@@ -36,11 +31,10 @@ The canonical UTXO leaf is:
 
 ```
 value:u64 (LE) || script_pubkey_len:u32 (LE) || script_pubkey
-       || ephemeral_len:u32 (LE) || ephemeral
 ```
 
-So the committed state includes the per-output KEM ciphertext (`ephemeral`)
-that a recipient needs to scan and recover their one-time WOTS+ spend key.
+ML-DSA-2 keys are reusable (stateless) — there is no one-time-use rule,
+no burnt-key set, and no per-output KEM ciphertext.
 
 ## Why a Sparse Merkle Tree (and not a flat hash / binary Merkle)
 
@@ -75,13 +69,12 @@ resulting state without replaying history.
 ## Snapshot & fast-sync
 
 A node can export a **snapshot** of its live state at any height via
-`FileStore::save_snapshot(dir)`. This writes the live UTXO set, burnt keys,
+`FileStore::save_snapshot(dir)`. This writes the live UTXO set,
 coinbase heights, tip, and chain work, plus a trustless `snapshot.meta`:
 
 ```
 snapshot.meta = { magic: "LITS", version: 1, height, block_hash, work, state_root }
-utxo.dat      = live UTXO set (+ per-UTXO KEM ciphertext)
-burnt.dat     = burnt WOTS+ commitments
+utxo.dat      = live UTXO set
 coinbase.dat  = coinbase heights
 chainmeta.dat = cumulative work / applied / PoW-valid sets
 tip.dat       = current tip hash
@@ -113,16 +106,13 @@ practically infeasible (PoW has no finality; this is "deep enough", not
 ## Invariants
 
 1. `state_root` is recomputed identically by every honest node from the same
-   post-block state. It MUST NOT depend on anything outside the UTXO set and
-   the burnt set.
+   post-block state. It MUST NOT depend on anything outside the UTXO set.
 2. Every `state_root != 0` block is rejected unless applying it reproduces that
    exact root (verified over a read-only overlay; the base is never partially
    mutated).
 3. The SMT and the live UTXO map are always in lock-step: an output added or
    spent in a block changes exactly one SMT leaf.
-4. Burnt commitments are accumulated monotonically; a commitment that appears
-   in `burnt_root` can never be spent again (enforces WOTS+ one-time use).
-5. Loading a snapshot must recompute the same `state_root` as the producer
+4. Loading a snapshot must recompute the same `state_root` as the producer
    stored in `snapshot.meta`; otherwise the snapshot is rejected.
-6. `state_root` is part of the PoW `challenge`, so the work binds to the state
+5. `state_root` is part of the PoW `challenge`, so the work binds to the state
    and a block cannot be re-stated after mining.

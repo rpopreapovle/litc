@@ -9,12 +9,12 @@ without reason. See [PHILOSOPHY.md](../PHILOSOPHY.md).
 
 ## Identity
 
-| Field        | Value                                  |
-|--------------|----------------------------------------|
-| Name         | LiTC (Lightweight Transaction Coin)    |
-| Ticker       | `LIT`                                  |
-| Mainnet addr | version byte `0x30` (`L…` in base58)  |
-| Testnet addr | version byte `0x6F` (`m…` in base58)  |
+| Field        | Value                                            |
+|--------------|--------------------------------------------------|
+| Name         | LiTC (Lightweight Transaction Coin)              |
+| Ticker       | `LIT`                                            |
+| Mainnet addr | bech32m `litc1q…` (~40 chars, version `0x31`)   |
+| Testnet addr | bech32m `tlitc1q…` (~40 chars, version `0x70`)  |
 
 ## Consensus
 
@@ -76,27 +76,27 @@ Derived from a **6-second** block time.
 
 ### Transaction
 
-- Inputs: `(prev_txid, prev_index, scheme: SignatureScheme, WOTS+ witness,
-  pubkey_root R)`. `scheme` declares the signature algorithm authorizing the
-  spend (see Cryptography). Only `Wots256` is active at launch; reserved ids
-  (`Reserved1..3`) are recognized but not yet active, and any unknown id is
-  rejected — even with a valid signature. The scheme byte is part of the
-  signed message, so a signature is bound to its scheme.
-- Outputs: `(value, HASH160(R) script, ephemeral)`.
-  - `ephemeral` is the ML-KEM ciphertext (768 bytes) attached to outputs sent
-    to a **reusable stealth address**. It is empty (zero-length) for ordinary
-    single-use outputs. The recipient decapsulates it with their scan key to
-    recover the one-time WOTS+ spend key; see [stealth.md](stealth.md).
+- Inputs: `(prev_txid, prev_index, scheme: SignatureScheme, signature,
+  pubkey)`. `scheme` declares the signature algorithm authorizing the
+  spend (see Cryptography). `Mldsa2` (ML-DSA-2, FIPS 204) is active at
+  launch; reserved ids (`Reserved1..3`) are recognized but not yet active,
+  and any unknown id is rejected — even with a valid signature. The scheme
+  byte is part of the signed message, so a signature is bound to its scheme.
+  `signature` is the ML-DSA-2 signature (~2420 bytes). `pubkey` is the full
+  ML-DSA-2 public key (1312 bytes), revealed at spend time.
+- Outputs: `(value, HASH160(pk) script)`. The script commits to
+  `HASH160(ml_dsa_pk)` (20 bytes). The full public key is revealed in the
+  input's `pubkey` field when spending.
 - Validation: inputs exist in UTXO set, signatures verify, sum(inputs) ≥
-  sum(outputs) + fee. The one-time WOTS+ rule (burnt-keys index) applies as
-  before — every stealth output gets a unique `R`, so reuse is impossible.
+  sum(outputs) + fee. ML-DSA-2 keys are reusable (stateless) — no
+  one-time-use rule or burnt-keys index needed.
 
 ### Block
 
 Header fields: `version`, `prev_hash`, `merkle_root`, `state_root`,
 `timestamp`, `height`, `epoch_seed`, `nonce`. `merkle_root` = double-SHA-256
 of transaction hashes. `state_root` commits to the entire live consensus state
-(UTXO set + burnt one-time-key set) after the block is applied — see
+(UTXO set) after the block is applied — see
 [state.md](state.md). `epoch_seed` seeds the PoW scratchpad for the current
 epoch (see [pow.md](pow.md)).
 
@@ -108,21 +108,15 @@ immutable for that network.
 
 ## Cryptography
 
-- **Signatures / keys**: `WOTS+` (hash-based, post-quantum, one-time). See
-  [wots.md](wots.md). Address = `base58check(version || HASH160(R))`, where `R`
-  is the WOTS+ public root.
-- **Reusable addresses (stealth)**: the user-facing address is a fixed
-  **ML-KEM-512** encapsulation public key (800 bytes), encoded as **Bech32m**
-  (HRP `litc` mainnet, `tlitc` testnet; the version byte `0x31`/`0x70` is
-  carried in the data). Bech32m keeps it lowercase and self-verifying. Paying
-  it wraps a fresh one-time WOTS+ key (locked into the output's `HASH160(R)`
-  script) and carries the KEM ciphertext in `ephemeral`. The recipient scans
-  the chain and recovers the WOTS+ spend key. See [stealth.md](stealth.md).
-  This hides the one-time nature of WOTS+ behind the wallet: the user copies
-  one address, while every on-chain output is unique and unlinkable. **The
-  string is still long** (~1.3k chars) because the full key is encoded — a
-  genuinely short address (hash-based, with the full key attached per output)
-  is tracked in [stealth.md](stealth.md) as future work.
+- **Signatures / keys**: **ML-DSA-2** (Dilithium, NIST FIPS 204, security
+  level 2). Pure integer NTT arithmetic (modulo 8380417), no floating-point
+  dependency. Stateless and reusable — one key can sign millions of
+  transactions. See `litc-primitives::mldsa`.
+  - Public key: 1312 bytes
+  - Signature: ~2420 bytes
+  - Address: `bech32m("litc", version || HASH160(pk))` → ~40 characters
+  - At spend time, the full public key (1312 bytes) is revealed in the
+    witness; the UTXO script commits to `HASH160(pk)` (20 bytes).
 - **Hashing**: SHA-256d for merkle roots and internal digests.
 - **PoW**: LiteHash (see [pow.md](pow.md)).
 
@@ -140,14 +134,14 @@ upfront; it may replace `File*` later behind the same traits.
 ## Consensus state commitment
 
 The header commits to the entire live state via `state_root =
-SHA-256d(utxo_root || burnt_root)`, where `utxo_root` and `burnt_root` are
-Sparse Merkle Tree roots (keyed by `H(txid||index)` and `H(commitment)`
-respectively; see [state.md](state.md)). A bootstrapping node verifies the
-root by applying each block to a read-only overlay and recomputing it — the
-PoW therefore secures not just the UTXO *transitions* but the resulting state.
+SHA-256d(utxo_root)`, where `utxo_root` is a Sparse Merkle Tree root
+(keyed by `H(txid||index)`; see [state.md](state.md)). A bootstrapping
+node verifies the root by applying each block to a read-only overlay and
+recomputing it — the PoW therefore secures not just the UTXO *transitions*
+but the resulting state.
 
 **Snapshot / fast-sync** (done): a node can start from a trusted snapshot of
-the UTXO + burnt sets plus the tip block, instead of replaying every block
+the UTXO set plus the tip block, instead of replaying every block
 from genesis. Loading is **trustless**: the file's `state_root` is recomputed
 from the loaded state and rejected on mismatch (tampering is detected, not
 trusted). Snapshot format is versioned (`magic "LITS"`, `version`); a fresh

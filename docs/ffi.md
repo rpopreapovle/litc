@@ -32,38 +32,14 @@ Cryptography (no chain state required):
 | Function | Purpose |
 |----------|---------|
 | `litc_random_seed(out, 32)` | 32-byte RNG seed for key derivation |
-| `litc_kem_keypair(seed, pk, sk)` | ML-KEM-512 keypair from a seed |
-| `litc_kem_encaps(pk, out_ss, out_ct)` | encapsulate a shared secret |
-| `litc_kem_decaps(sk, ct, out_ss)` | decapsulate (recipient only) |
-| `litc_wots_commit(seed, index, out_commit)` | WOTS+ commitment (20-byte address) |
-| `litc_wots_address(seed, index, ver, *out_addr)` | base58check address from a commit |
-| `litc_wots_sign(seed, index, msg, out_sig, cap, *len)` | one-time signature |
-| `litc_wots_verify(commit, msg, sig, sig_len)` | verify a signature |
-| `litc_stealth_address(pk, ver, *out_addr)` | reusable stealth address (800 B) |
-| `litc_parse_stealth_address(s, pk, *testnet)` | decode an address back to a pk |
-| `litc_stealth_build_output(pk, value, *out_bytes, *len, *out_ct, *ct_len)` | one-time output **and** the tx-level ciphertext |
-| `litc_stealth_commit(sk, ct, index, out_commit)` | recipient commitment from sk+ct at `index` |
-| `litc_stealth_sign(sk, ct, index, msg, out_sig, cap, *len)` | sign a stealth spend at `index` |
-| `litc_txout_decode(bytes, len, *value, out_commit, *out_ephemeral, *eph_len)` | recover output fields |
+| `litc_mldsa_keypair(seed, pk, sk)` | ML-DSA-2 keypair from a 32-byte seed |
+| `litc_mldsa_address(pk, ver, *out_addr)` | bech32m address from a public key |
+| `litc_mldsa_sign(sk, msg, out_sig, cap, *len)` | sign a 32-byte message |
+| `litc_mldsa_verify(pk, msg, sig, sig_len)` | verify a signature |
+| `litc_parse_address(s, *out_hash, *testnet)` | decode an address back to HASH160(pk) |
 
-Helper sizes: `litc_kem_pk_len()`, `litc_kem_sk_len()`,
-`litc_kem_ct_len()`, `litc_kem_ss_len()`, `litc_wots_sig_len()`.
+Helper sizes: `litc_mldsa_pk_len()` (1312), `litc_mldsa_sig_len()` (2420).
 
-## Language sizes (constant, see `docs/stealth.md`)
+## Language sizes (constant)
 
-`KEM_PK=800  KEM_SK=64  KEM_CT=768  KEM_SS=32  WOTS_SIG=1152  COMMIT=20`.
-
-> `litc_stealth_build_output` returns **both** the serialized `TxOut` and the
-> KEM ciphertext (`out_ct`). Store `out_ct` in the transaction's `ephemeral`
-> field — that is what the recipient passes to `litc_stealth_commit` /
-> `litc_stealth_sign`. The output itself carries no ciphertext.
-
-## C example
-
-`crates/litc-ffi/examples/example.c` exercises the whole flow
-(stealth address → one-time output → decode → sign → verify):
-
-```bash
-cc examples/example.c -I include -L ../../target/debug -llitc_ffi -o demo
-LD_LIBRARY_PATH=../../target/debug ./demo
-```
+`MLDSA_PK=1312  MLDSA_SIG=2420  MLDSA_SEED=32  HASH160=20`.

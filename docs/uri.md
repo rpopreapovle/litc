@@ -10,8 +10,8 @@ litc:
 ```
 
 No separate testnet scheme — the network is encoded **inside** the address
-(`L…`/`m…` for WOTS+, `litc…`/`tlitc…` for stealth). Wallets detect the
-network from the address prefix.
+(`litc1…` mainnet, `tlitc1…` testnet). Wallets detect the network from the
+address prefix.
 
 ## Syntax
 
@@ -21,7 +21,7 @@ litc:<address>[?amount=<satoshis>][&label=<text>][&message=<text>]
 
 | Component | Required | Description |
 |-----------|----------|-------------|
-| `address` | yes | A LiTC address (stealth or WOTS+) |
+| `address` | yes | A LiTC ML-DSA-2 address (`litc1q…` or `tlitc1q…`) |
 | `amount`  | no  | Amount in **satoshis** (integer, no decimals) |
 | `label`   | no  | Short label for the recipient (UTF-8, URL-encoded) |
 | `message` | no  | Payment note / memo (UTF-8, URL-encoded) |
@@ -37,37 +37,21 @@ Parameters are separated by `&`. The first parameter uses `?`.
 | `expire`  | Seconds until the request expires |
 | `chain`   | Explicit network hint (`mainnet` / `testnet`) — normally inferred |
 
-## Address formats
+## Address format
 
-### Stealth address (recommended)
-
-Reusable, post-quantum. **This is the address users should share.**
+ML-DSA-2 (Dilithium, FIPS 204) addresses — ~40 characters.
 
 ```
-Bech32m(KEM_version || KEM_pk)
+bech32m("litc", version || HASH160(ml_dsa_pk))
 ```
 
-- Mainnet: HRP `litc`, version `0x31`
-- Testnet: HRP `tlitc`, version `0x70`
-- Length: ~1300 characters (800-byte KEM key)
+- Mainnet: HRP `litc`, version `0x31` → `litc1q…`
+- Testnet: HRP `tlitc`, version `0x70` → `tlitc1q…`
+- Payload: `HASH160(ml_dsa_pk)` = 20 bytes
+- Full public key (1312 bytes) is revealed at spend time in the witness
 
 ```
-litc:litc1qqqq...<bech32m data>...qqxq9cxsy?amount=1000000&label=Alice
-```
-
-### WOTS+ one-time address (legacy)
-
-One-time, derived per payment. For compatibility only; prefer stealth.
-
-```
-base58check(version || HASH160(R))
-```
-
-- Mainnet: version `0x30` → addresses start with `L`
-- Testnet: version `0x6F` → addresses start with `m`
-
-```
-litc:LXhE3gHJzVtGHbPQ...<base58>...<checksum>?amount=50000
+litc:litc1qvr83j4q2y9dxhlw4gkxp0n0a3q0n2m8m3z4c5x?amount=1000000&label=Alice
 ```
 
 ## QR code encoding
@@ -84,67 +68,42 @@ litc:<address>[?params...]
 |----------|-------|
 | Format   | UTF-8 text |
 | Error correction | **M** (15%) minimum; **L** acceptable for short URIs |
-| Max payload | QR Version 40, binary: 2,953 bytes — stealth URIs (~1350 chars) fit comfortably |
-
-### QR generation workflow
-
-1. Build the URI string.
-2. Encode as UTF-8 bytes.
-3. Generate QR with error correction level M.
-4. (Optional) Overlay logo in center — keep below 30% of QR area.
+| Max payload | QR Version 40, binary: 2,953 bytes — litc URIs (~80 chars) fit easily |
 
 ### Size guidelines
 
 | Use case | QR modules | Physical size |
 |----------|-----------|---------------|
-| Screen display | 25×25+ | ≥ 2 cm × 2 cm |
-| Print (paper) | 33×33+ | ≥ 2.5 cm × 2.5 cm |
-| Small sticker | 21×21 | ≥ 1.5 cm × 1.5 cm |
+| Screen display | 21×21+ | ≥ 1.5 cm × 1.5 cm |
+| Print (paper) | 25×25+ | ≥ 2 cm × 2 cm |
 
 ## Examples
 
 ### Basic payment request
 
 ```
-litc:litc1qq...?amount=1000000
-```
-
-Encoded in QR:
-```
-┌─────────────────────┐
-│  ██ ▄▄▄ █▄█ ▄▄▄ █  │
-│  █▄█ █▄█ █▄█ █▄█ █  │
-│  ██ ▄▄▄ █▀█ ▄▄▄ ██ │
-│  ...                │
-│  litc:litc1qq...    │
-└─────────────────────┘
+litc:litc1qvr83j4q2y9dxhlw4gkxp0n0a3q0n2m8m3z4c5x?amount=1000000
 ```
 
 ### Payment with label and memo
 
 ```
-litc:litc1qq...?amount=500000&label=Coffee%20Shop&message=Order%20%2342
-```
-
-### WOTS+ address (legacy)
-
-```
-litc:LXhE3gHJzVtGHbPQKj7nR9mW4sT1yU6iO0p?amount=25000
+litc:litc1qvr83j4q2y9dxhlw4gkxp0n0a3q0n2m8m3z4c5x?amount=500000&label=Coffee%20Shop&message=Order%20%2342
 ```
 
 ### Testnet
 
 ```
-litc:tlitc1qq...?amount=100000
+litc:tlitc1qvr83j4q2y9dxhlw4gkxp0n0a3q0n2m8m3z4c5x?amount=100000
 ```
 
 ## Parsing rules
 
 1. **Validate prefix**: string must start with `litc:` (case-insensitive).
 2. **Extract address**: everything before `?` (or the full string if no `?`).
-3. **Detect address type**:
-   - Starts with `litc1` or `tlitc1` → **stealth** (Bech32m)
-   - Starts with `L` or `m` → **WOTS+** (base58check)
+3. **Detect network**:
+   - Starts with `litc1` → **mainnet**
+   - Starts with `tlitc1` → **testnet**
 4. **Parse query parameters**: standard `key=value` pairs, URL-decoded.
 5. **Validate amount**: if present, must be a positive integer (satoshis).
 6. **Unknown parameters**: ignored (forward-compatible).
@@ -174,18 +133,17 @@ litc wallet receive --amount 1000000  # pre-filled amount
 ### Parse URI (from clipboard, QR scan, deep link)
 
 ```bash
-litc wallet decode-uri "litc:litc1qq...?amount=100000"
-# → address: litc1qq...
+litc wallet decode-uri "litc:litc1q...?amount=100000"
+# → address: litc1q...
 # → amount: 100000
-# → type: stealth
 # → network: mainnet
 ```
 
 ### Send from URI
 
 ```bash
-litc wallet send-uri "litc:litc1qq...?amount=100000"
-# equivalent to: litc wallet send-stealth litc1qq... 100000
+litc wallet send-uri "litc:litc1q...?amount=100000"
+# equivalent to: litc wallet send litc1q... 100000
 ```
 
 ## Comparison with BIP-21
@@ -194,7 +152,8 @@ litc wallet send-uri "litc:litc1qq...?amount=100000"
 |--------|-------------------|----------|
 | Scheme | `bitcoin:` | `litc:` |
 | Amount unit | BTC (decimal) | satoshis (integer) |
-| Address types | P2PKH, P2SH, bech32 | WOTS+ (base58), stealth (bech32m) |
+| Address types | P2PKH, P2SH, bech32 | ML-DSA-2 (bech32m) |
+| Address length | ~34-62 chars | ~40 chars |
 | Network encoding | In address prefix | In address prefix |
 | Payment requests | `r=` parameter | `r=` parameter (reserved) |
 | QR content | URI string | URI string |
@@ -203,8 +162,6 @@ litc wallet send-uri "litc:litc1qq...?amount=100000"
 
 - **Amount in satoshis, not LIT.** Avoids floating-point ambiguity.
 - **Label and message are informational.** They are NOT signed or on-chain.
-- **Stealth addresses are long (~1300 chars).** QR codes handle this fine
-  (Version 40 supports 2953 bytes), but wallets should also support
-  truncation + server-side resolution for UX.
+- **ML-DSA-2 addresses are ~40 characters.** QR codes handle this trivially.
 - **No `r=` in QR by default.** Payment requests (BIP-70 style) require HTTPS
   and are a separate flow. QR should encode the address directly.

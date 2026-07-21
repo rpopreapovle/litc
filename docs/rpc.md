@@ -41,10 +41,10 @@ curl -s http://127.0.0.1:18334/ \
 
 | Method | Params | Returns |
 |---|---|---|
-| `getstealthaddress` | `[]` | The wallet's reusable stealth address |
-| `getbalance` | `[]` | Stealth balance (satoshis and formatted) |
+| `getaddress` | `[]` | The wallet's ML-DSA-2 address |
+| `getbalance` | `[]` | Balance (satoshis and formatted) |
 | `listunspent` | `[min_amount?]` | Array of UTXOs with txid, vout, amount |
-| `sendtostealthaddress` | `[to, amount, from_index?]` | Build, sign, and submit tx to stealth address |
+| `send` | `[to, amount]` | Build, sign, and submit tx |
 | `gettransaction` | `[txid]` | Transaction info (mempool + chain) |
 
 `amount` is either raw satoshis or `<n>.<frac>LIT` (e.g. `"10.5"` = 10.5 LIT).

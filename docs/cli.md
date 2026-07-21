@@ -10,11 +10,9 @@ State lives under `$LITC_DATADIR` (default `./data`):
 | File                | Contents                                              |
 |---------------------|-------------------------------------------------------|
 | `wallet.dat`        | 32-byte master seed (the only secret)                 |
-| `wallet.dat.stealth` | recovered one-time stealth spend keys (persisted)   |
 | `chain.dat`         | append-only block records (header + optional body)    |
 | `chain.idx`         | per-height index for seeking                          |
 | `utxo.dat`          | the live UTXO set (flat, rewritten on every change)   |
-| `burnt.dat`         | spent output commitments (20-byte keys)               |
 | `tip.dat`           | current best-block hash                               |
 | `mempool/*.tx`      | signed transactions waiting to be mined               |
 
@@ -53,31 +51,27 @@ Node flags:
 | `--network <name>`    | `testnet` or `mainnet` (default `testnet`)                  |
 
 The node persists chain under `$LITC_DATADIR` and drains `mempool/*.tx`
-(written by `wallet send` / `send-stealth`), relaying and mining them.
+(written by `wallet send`), relaying and mining them.
 
 ## `litc wallet`
 
 ```bash
-litc wallet new                # create wallet; print the reusable stealth address
-litc wallet stealth            # print the reusable stealth address
-litc wallet balance            # confirmed stealth balance
-litc wallet scan               # scan for owned stealth outputs
-litc wallet send-stealth <to> <amount> [--from i]   # pay a stealth address
+litc wallet new                # create wallet; print the ML-DSA-2 address
+litc wallet balance            # confirmed balance
+litc wallet send <to> <amount> # pay a LiTC address
 ```
 
 `<amount>` is whole satoshis or `<n>.<frac>LIT` (e.g. `10.5` = 10.5 LIT).
-`send-stealth` writes a signed tx to `mempool/<txid>.tx` and prints
-the hex; a running `litc node` picks it up.
+`send` writes a signed tx to `mempool/<txid>.tx` and prints the hex;
+a running `litc node` picks it up.
 
 ## Example session
 
 ```bash
 export LITC_DATADIR=/tmp/litc-demo
-litc wallet new                 # fresh seed, stealth address printed
-litc node --port 8333 &         # starts mining to this wallet's stealth address
+litc wallet new                 # fresh seed, litc1q... address printed
+litc node --port 8333 &         # starts mining to this wallet's address
 sleep 9
-litc wallet balance             # shows mined coinbase (50 LIT/block)
-litc wallet send-stealth "$(litc wallet stealth)" 10.0   # pay self
-sleep 9
-litc wallet scan                # the stealth output is found
+litc wallet balance             # shows mined coinbase (5 LIT/block)
+litc wallet send "$(litc wallet address)" 10.0   # pay self
 ```

@@ -16,7 +16,7 @@ LiTC is a lightweight Proof-of-Work cryptocurrency for ordinary users.
 | Block time          | ~15 seconds                             |
 | Confirmations       | 1 block = everyday pay; 6 = high value |
 | Mining              | CPU + optional wgpu GPU backend          |
-| Cryptography        | WOTS+ (PQ-safe, one-time), ML-KEM-512 stealth addresses |
+| Cryptography        | ML-DSA-2 (Dilithium, FIPS 204, PQ, reusable) |
 | Supply cap          | 84,000,000 LIT                          |
 | Codebase            | Rust, workspace of small crates         |
 | Platform            | Linux-first, portable                   |
@@ -39,7 +39,7 @@ litc/
   docs/                 # this documentation (English)
   crates/
     litc-wire           # binary codec: Message, Serialize/Deserialize
-    litc-primitives     # hash, merkle, WOTS+ keys/sign, block, tx
+    litc-primitives     # hash, merkle, ML-DSA-2 keys/sign, block, tx
     litc-store          # append-only block store + UTXO set
     litc-core           # validation, utxo, mempool, difficulty, reorg
     litc-keystore       # file-backed secret store
@@ -60,8 +60,8 @@ litc/
 - [protocol.md](protocol.md) — binary P2P wire format.
 - [mining.md](mining.md) — algorithm and commodity hardware.
 - [pow.md](pow.md) — LiteHash design.
-- [wots.md](wots.md) — WOTS+ signatures (legacy).
-- [stealth.md](stealth.md) — stealth address protocol (legacy).
+- [wots.md](wots.md) — WOTS+ signatures (**historical**, removed).
+- [stealth.md](stealth.md) — stealth address protocol (**historical**, removed).
 - [ml-dsa-migration.md](ml-dsa-migration.md) — ML-DSA-2 migration plan.
 - [benchmarks.md](benchmarks.md) — hardware measurements.
 - [running-a-node.md](running-a-node.md) — build, configure, run.

@@ -10,39 +10,29 @@ The wallet is deliberately split from secret storage
 
 ## Keys and addresses
 
-- Scheme: **WOTS+** (hash-based, post-quantum, one-time). See [wots.md](wots.md).
-- Address: `base58check(version || HASH160(R))`, where `R` is the WOTS+ public
-  root committed by the key.
-  - Mainnet version `0x30` → `L…`
-  - Testnet version `0x6F` → `m…`
-- The wallet derives a **fresh address per payment** from the master seed, so
-  addresses are never reused (one-time signatures + built-in privacy).
-- For a **stable, reusable address**, the wallet also derives an ML-KEM-512
-  encapsulation key from the master seed and exposes it as a stealth address
-  (Bech32m, HRP `litc`/`tlitc` on mainnet/testnet, version byte in the data).
-  Give this single address out; every payment you receive lands on a unique
-  one-time
-  WOTS+ output that only your wallet can recognize and spend. See
-  [stealth.md](stealth.md).
+- Scheme: **ML-DSA-2** (Dilithium, NIST FIPS 204). Stateless, reusable
+  post-quantum signatures. See `litc-primitives::mldsa`.
+- Address: `bech32m("litc", version || HASH160(ml_dsa_pk))` → ~40 characters.
+  - Mainnet: HRP `litc`, version `0x31` → `litc1q…`
+  - Testnet: HRP `tlitc`, version `0x70` → `tlitc1q…`
+- The wallet derives a **keypair from the master seed** deterministically.
+  One address per seed+index. ML-DSA-2 keys are reusable — no one-time
+  limitation, no stealth scanning, no burnt keys.
+- At spend time, the full public key (1312 bytes) is revealed in the
+  witness. The UTXO script commits to `HASH160(pk)` (20 bytes).
 
 ## Commands
 
 ```bash
 litc wallet new                 # new keypair in KeyStore, prints address
-litc wallet stealth             # print reusable stealth address
-litc wallet balance <address>  # confirmed + pending (works for both kinds)
-litc wallet send <to> <amount> # build + sign (KeyStore) + submit via RPC
-litc wallet send-stealth <to> <amount>  # pay a reusable stealth address
+litc wallet balance <address>   # confirmed + pending
+litc wallet send <to> <amount>  # build + sign (KeyStore) + submit via RPC
 ```
-
 
 ## Backup
 
-For `FileKeyStore`, back up `wallet.dat` (or the exported private key). Recovered
-stealth spend keys are persisted alongside it in `wallet.dat.stealth`, so back
-up both — without the `.stealth` file you can still *see* your balance (the
-scan key is in `wallet.dat`) but cannot *spend* previously received stealth
-outputs. Because secrets live only in the KeyStore, switching to a hardware
+For `FileKeyStore`, back up `wallet.dat` (or the exported private key).
+Because secrets live only in the KeyStore, switching to a hardware
 wallet later needs no wallet rewrite — just point `wallet.keystore` at the new
 backend.
 
