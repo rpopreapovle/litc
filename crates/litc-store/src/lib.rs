@@ -5,10 +5,6 @@
 //! [`MemoryStore`] (in-memory, for tests and ephemeral nodes) and
 //! [`FileStore`] (append-only block store with continuous pruning for real
 //! nodes — see `docs/running-a-node.md`).
-//!
-//! The `BurntKeys` index enforces the WOTS+ one-time-use rule (see
-//! `docs/wots.md`): a key's commitment (`HASH160(R)`) may be spent exactly
-//! once.
 #![allow(clippy::items_after_test_module)]
 
 use litc_primitives::{
@@ -19,19 +15,16 @@ use std::collections::{HashMap, HashSet};
 
 pub mod state;
 
-/// A UTXO set plus the per-UTXO tx-level ephemeral ciphertext map, as
-/// persisted in `utxo.dat`.
-type UtxoSets = (HashMap<OutPoint, TxOut>, HashMap<OutPoint, Vec<u8>>);
+/// A UTXO set, as persisted in `utxo.dat`.
+type UtxoSets = HashMap<OutPoint, TxOut>;
 
-/// Records the UTXO / one-time-key changes a block made, so they can be
+/// Records the UTXO changes a block made, so they can be
 /// rolled back on a chain reorganisation. `created` are outputs the block
-/// added, `spent` are outputs it consumed (with their values, to restore),
-/// `burnt` are the one-time keys it marked spent.
+/// added, `spent` are outputs it consumed (with their values, to restore).
 #[derive(Clone, Default)]
 pub struct UndoData {
     pub created: Vec<OutPoint>,
     pub spent: Vec<(OutPoint, TxOut)>,
-    pub burnt: Vec<[u8; 20]>,
     /// Coinbase outputs this block created, with the height at which they were
     /// created (so `disconnect` can drop them).
     pub coinbase_created: Vec<(OutPoint, u64)>,
@@ -64,21 +57,19 @@ pub trait ChainStore {
 
 /// The unspent output set.
 pub trait UtxoStore {
-    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut, ephemeral: Vec<u8>);
+    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut);
     fn spend_utxo(&mut self, outpoint: &OutPoint) -> Result<TxOut, String>;
     fn utxo(&self, outpoint: &OutPoint) -> Option<&TxOut>;
     /// Find the outpoint whose `script_pubkey` is the given 20-byte commitment.
     fn find_by_commit(&self, commit: &[u8; 20]) -> Option<OutPoint>;
-    /// Iterate every unspent output with its transaction-level KEM ciphertext
-    /// (used by the wallet to scan for stealth payments). The ciphertext is
-    /// empty for outputs with no stealth component.
-    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut, Vec<u8>)>;
+    /// Iterate every unspent output.
+    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut)>;
     /// Remove an unspent output without recording a spend (e.g. when moving a
     /// UTXO forward during a test/migration). Used by the fast-sync e2e test.
     fn remove_utxo(&mut self, outpoint: &OutPoint);
 }
 
-/// Store abilities the validator needs: a UTXO set plus the one-time index.
+/// Store abilities the validator needs: a UTXO set.
 /// Defined here (not in `litc-core`) to avoid a dependency cycle:
 /// `litc-core` depends on `litc-store`.
 ///
@@ -87,9 +78,6 @@ pub trait UtxoStore {
 /// `begin_block`/`end_block`), can roll a block back with `disconnect`,
 /// and tracks cumulative `work` so the heaviest chain wins.
 pub trait SpendStore: UtxoStore + BlockStore + ChainStore {
-    fn mark_spent_once(&mut self, commit: &[u8; 20]) -> Result<(), String>;
-    fn is_burnt(&self, commit: &[u8; 20]) -> bool;
-
     /// Record that `op` is a coinbase output created at `height`. Used to
     /// enforce coinbase maturity: a coinbase UTXO may not be spent until
     /// `COINBASE_MATURITY` blocks have been mined on top of its block.
@@ -103,7 +91,7 @@ pub trait SpendStore: UtxoStore + BlockStore + ChainStore {
     fn end_block(&mut self);
     /// Undo data recorded for `hash`, if any.
     fn get_undo(&self, hash: &Hash32) -> Option<UndoData>;
-    /// Roll a previously-applied block back (restore spent UTXOs, un-burn keys).
+    /// Roll a previously-applied block back (restore spent UTXOs).
     fn disconnect(&mut self, hash: &Hash32);
 
     /// Remember that `hash` already passed Proof-of-Work validation.
@@ -125,17 +113,6 @@ pub trait SpendStore: UtxoStore + BlockStore + ChainStore {
 }
 
 impl SpendStore for MemoryStore {
-    fn mark_spent_once(&mut self, commit: &[u8; 20]) -> Result<(), String> {
-        self.mark_spent_once(commit)?;
-        if let Some((_, u)) = &mut self.current {
-            u.burnt.push(*commit);
-        }
-        Ok(())
-    }
-    fn is_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.burnt().is_burnt(commit)
-    }
-
     fn mark_coinbase(&mut self, op: &OutPoint, height: u64) {
         self.coinbase.insert(op.clone(), height);
         if let Some((_, u)) = &mut self.current {
@@ -185,65 +162,16 @@ impl SpendStore for MemoryStore {
 }
 
 // ---------------------------------------------------------------------------
-// BurntKeys — WOTS+ one-time-use index
-// ---------------------------------------------------------------------------
-
-/// Set of WOTS+ public-key commitments (`HASH160(R)`) that have already been
-/// spent. Re-spending a burnt key is rejected by the validator.
-#[derive(Default, Clone)]
-pub struct BurntKeys {
-    burnt: HashSet<[u8; 20]>,
-}
-
-impl BurntKeys {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn burn(&mut self, commit: &[u8; 20]) {
-        self.burnt.insert(*commit);
-    }
-
-    pub fn is_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.burnt.contains(commit)
-    }
-
-    /// Remove a previously-burnt commitment (used when rolling back a block).
-    pub fn un_burn(&mut self, commit: &[u8; 20]) {
-        self.burnt.remove(commit);
-    }
-
-    pub fn len(&self) -> usize {
-        self.burnt.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.burnt.is_empty()
-    }
-
-    /// Direct reference to the underlying spent-commitment set.
-    pub fn commits(&self) -> &HashSet<[u8; 20]> {
-        &self.burnt
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MemoryStore
 // ---------------------------------------------------------------------------
 
-/// In-memory implementation of all store traits, plus the burnt-keys index.
+/// In-memory implementation of all store traits.
 #[derive(Default)]
 pub struct MemoryStore {
     blocks: HashMap<Hash32, Block>,
     height: HashMap<Hash32, u64>,
     tip: Option<Hash32>,
     utxos: HashMap<OutPoint, TxOut>,
-    /// Transaction-level KEM ciphertext per UTXO (carried from the funding
-    /// transaction's `Transaction.ephemeral`). Empty for non-stealth outputs.
-    /// Kept here so the wallet can recover stealth keys even after the funding
-    /// block body is pruned.
-    utxo_ephemeral: HashMap<OutPoint, Vec<u8>>,
-    burnt: BurntKeys,
     /// Creation height of every live coinbase output, so spends can be checked
     /// against the coinbase-maturity rule.
     coinbase: HashMap<OutPoint, u64>,
@@ -258,25 +186,6 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn burnt(&self) -> &BurntKeys {
-        &self.burnt
-    }
-
-    pub fn burnt_mut(&mut self) -> &mut BurntKeys {
-        &mut self.burnt
-    }
-
-    /// Enforce the WOTS+ one-time rule: reject if the commitment was already
-    /// spent, otherwise mark it burnt. Call only after the signature is
-    /// verified for this spend.
-    pub fn mark_spent_once(&mut self, commit: &[u8; 20]) -> Result<(), String> {
-        if self.burnt.is_burnt(commit) {
-            return Err("address already spent (WOTS+ one-time)".into());
-        }
-        self.burnt.burn(commit);
-        Ok(())
     }
 
     /// Best known chain height (derived from the current tip).
@@ -340,7 +249,7 @@ impl MemoryStore {
         }
     }
     /// Roll back a previously-applied block: drop created outputs, restore
-    /// spent outputs, and un-burn the keys it spent.
+    /// spent outputs.
     pub fn disconnect(&mut self, hash: &Hash32) {
         if let Some(u) = self.undo.remove(hash) {
             for op in &u.created {
@@ -348,9 +257,6 @@ impl MemoryStore {
             }
             for (op, out) in &u.spent {
                 self.utxos.insert(op.clone(), out.clone());
-            }
-            for c in &u.burnt {
-                self.burnt.un_burn(c);
             }
             for (op, _) in &u.coinbase_created {
                 self.coinbase.remove(op);
@@ -391,19 +297,17 @@ impl ChainStore for MemoryStore {
 }
 
 impl UtxoStore for MemoryStore {
-    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut, ephemeral: Vec<u8>) {
+    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut) {
         if let Some((_, u)) = &mut self.current {
             u.created.push(outpoint.clone());
         }
-        self.utxos.insert(outpoint.clone(), output);
-        self.utxo_ephemeral.insert(outpoint, ephemeral);
+        self.utxos.insert(outpoint, output);
     }
     fn spend_utxo(&mut self, outpoint: &OutPoint) -> Result<TxOut, String> {
         let out = self
             .utxos
             .remove(outpoint)
             .ok_or_else(|| "utxo not found".to_string())?;
-        self.utxo_ephemeral.remove(outpoint);
         if let Some((_, u)) = &mut self.current {
             u.spent.push((outpoint.clone(), out.clone()));
         }
@@ -425,21 +329,14 @@ impl UtxoStore for MemoryStore {
         }
         None
     }
-    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut, Vec<u8>)> {
+    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut)> {
         self.utxos
             .iter()
-            .map(|(op, out)| {
-                (
-                    op.clone(),
-                    out.clone(),
-                    self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
-                )
-            })
+            .map(|(op, out)| (op.clone(), out.clone()))
             .collect()
     }
     fn remove_utxo(&mut self, outpoint: &OutPoint) {
         self.utxos.remove(outpoint);
-        self.utxo_ephemeral.remove(outpoint);
     }
 }
 
@@ -449,28 +346,18 @@ impl state::StateStore for MemoryStore {
             output: TxOut {
                 value: out.value,
                 script_pubkey: out.script_pubkey.clone(),
-                ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
             },
             coinbase_height: self.coinbase.get(op).copied(),
         })
     }
     fn put_utxo(&mut self, op: OutPoint, entry: state::UtxoEntry) {
-        self.add_utxo(op.clone(), entry.output.clone(), entry.output.ephemeral.clone());
+        self.add_utxo(op.clone(), entry.output.clone());
         if let Some(h) = entry.coinbase_height {
             self.mark_coinbase(&op, h);
         }
     }
     fn remove_utxo(&mut self, op: &OutPoint) {
         let _ = self.spend_utxo(op);
-    }
-    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.burnt.is_burnt(commit)
-    }
-    fn mark_burnt(&mut self, commit: [u8; 20]) {
-        let _ = self.mark_spent_once(&commit);
-    }
-    fn iter_burnt(&self) -> Vec<[u8; 20]> {
-        self.burnt.commits().iter().copied().collect()
     }
     fn root(&self) -> [u8; 32] {
         let utxos: Vec<(OutPoint, state::UtxoEntry)> = self
@@ -483,15 +370,13 @@ impl state::StateStore for MemoryStore {
                         output: TxOut {
                             value: out.value,
                             script_pubkey: out.script_pubkey.clone(),
-                            ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
                         },
                         coinbase_height: self.coinbase.get(op).copied(),
                     },
                 )
             })
             .collect();
-        let burnt: Vec<[u8; 20]> = self.burnt.commits().iter().copied().collect();
-        state::state_root_of(utxos, burnt)
+        state::state_root_of(utxos)
     }
     fn iter_utxos(&self) -> Vec<(OutPoint, state::UtxoEntry)> {
         self.utxos
@@ -503,7 +388,6 @@ impl state::StateStore for MemoryStore {
                         output: TxOut {
                             value: out.value,
                             script_pubkey: out.script_pubkey.clone(),
-                            ephemeral: self.utxo_ephemeral.get(op).cloned().unwrap_or_default(),
                         },
                         coinbase_height: self.coinbase.get(op).copied(),
                     },
@@ -527,9 +411,7 @@ mod tests {
             outputs: vec![TxOut {
                 value: Amount(5 * 100_000_000),
                 script_pubkey: commit.to_vec(),
-                ephemeral: vec![],
             }],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let op = litc_primitives::OutPoint {
@@ -573,7 +455,6 @@ mod tests {
                         index: i as u32,
                     },
                     out.clone(),
-                    vec![],
                 );
             }
         }
@@ -582,44 +463,6 @@ mod tests {
         assert_eq!(spent.value, Amount(5 * 100_000_000));
         assert!(s.utxo(&op).is_none());
         assert!(s.spend_utxo(&op).is_err());
-    }
-
-    #[test]
-    fn burnt_keys_basic() {
-        let mut b = BurntKeys::new();
-        let c = [7u8; 20];
-        assert!(!b.is_burnt(&c));
-        b.burn(&c);
-        assert!(b.is_burnt(&c));
-        assert_eq!(b.len(), 1);
-    }
-
-    #[test]
-    fn one_time_rejects_reuse() {
-        let (block, op) = coinbase([9u8; 20]);
-        let commit = [9u8; 20];
-        let mut s = MemoryStore::new();
-        for tx in &block.txs {
-            for (i, out) in tx.outputs.iter().enumerate() {
-                s.add_utxo(
-                    litc_primitives::OutPoint {
-                        txid: tx.txid(),
-                        index: i as u32,
-                    },
-                    out.clone(),
-                    vec![],
-                );
-            }
-        }
-        // First spend of this address: ok, marks it burnt.
-        assert!(s.mark_spent_once(&commit).is_ok());
-        assert!(s.burnt().is_burnt(&commit));
-        // A second output at the same address must be rejected.
-        s.add_utxo(op.clone(), block.txs[0].outputs[0].clone(), vec![]);
-        assert!(s.mark_spent_once(&commit).is_err());
-        // Spending the second utxo is blocked by the one-time rule.
-        assert!(s.spend_utxo(&op).is_ok()); // utxo still removable...
-        assert!(s.mark_spent_once(&commit).is_err()); // ...but key stays burnt
     }
 }
 
@@ -630,7 +473,6 @@ mod tests {
 //   chain.dat   append-only block records (header always; body optionally)
 //   chain.idx   tiny sidecar: per-height (offset, len, has_body) entries
 //   utxo.dat    flat list of *live* outputs (rewritten on each UTXO change)
-//   burnt.dat   flat list of spent WOTS+ commitments
 //   tip.dat     32-byte current tip hash
 //
 // Pruning keeps only the last `keep_depth` block bodies on disk; older blocks
@@ -650,7 +492,7 @@ const SNAPSHOT_MAGIC: &[u8; 4] = b"LITS";
 const SNAPSHOT_VERSION: u32 = 1;
 
 /// Self-describing snapshot header. The only trust anchor is `state_root`: a
-/// loader recomputes it from the loaded UTXO/burnt set and rejects the snapshot
+/// loader recomputes it from the loaded UTXO set and rejects the snapshot
 /// if it does not match. `work` lets the fast-synced node keep the snapshot tip
 /// as its best chain for reorg comparisons against new blocks.
 pub struct SnapshotMeta {
@@ -818,12 +660,11 @@ fn parse_index(buf: &[u8]) -> Result<HashMap<u64, (u64, u64, bool)>, String> {
 
 // --- utxo.dat: flat list of live outputs ------------------------------------
 // count:u32 | for each: txid:32 | index:u32 | value:u64 | script_len:u32
-//                    | script | ephemeral_len:u32 | ephemeral
+//                    | script
 
 fn write_utxos(
     path: &Path,
     utxos: &HashMap<OutPoint, TxOut>,
-    ephemeral: &HashMap<OutPoint, Vec<u8>>,
 ) -> std::io::Result<()> {
     let mut w = Vec::new();
     w.extend_from_slice(&(utxos.len() as u32).to_le_bytes());
@@ -833,9 +674,6 @@ fn write_utxos(
         w.extend_from_slice(&(out.value.0).to_le_bytes());
         w.extend_from_slice(&(out.script_pubkey.len() as u32).to_le_bytes());
         w.extend_from_slice(&out.script_pubkey);
-        let eph = ephemeral.get(op).map(|e| e.as_slice()).unwrap_or(&[]);
-        w.extend_from_slice(&(eph.len() as u32).to_le_bytes());
-        w.extend_from_slice(eph);
     }
     fs::write(path, w)
 }
@@ -850,7 +688,6 @@ fn parse_utxos(buf: &[u8]) -> Result<UtxoSets, String> {
     pos += 4;
     let count = u32::from_le_bytes(c);
     let mut map = HashMap::new();
-    let mut eph = HashMap::new();
     for _ in 0..count {
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&buf[pos..pos + 32]);
@@ -867,27 +704,18 @@ fn parse_utxos(buf: &[u8]) -> Result<UtxoSets, String> {
         let slen = u32::from_le_bytes(sl) as usize;
         let script = buf[pos..pos + slen].to_vec();
         pos += slen;
-        let mut el = [0u8; 4];
-        el.copy_from_slice(&buf[pos..pos + 4]);
-        pos += 4;
-        let elen = u32::from_le_bytes(el) as usize;
-        let ephemeral = buf[pos..pos + elen].to_vec();
-        pos += elen;
-        let op = OutPoint {
-            txid: Hash32(txid),
-            index: u32::from_le_bytes(idx),
-        };
         map.insert(
-            op.clone(),
+            OutPoint {
+                txid: Hash32(txid),
+                index: u32::from_le_bytes(idx),
+            },
             TxOut {
                 value: Amount(u64::from_le_bytes(val)),
                 script_pubkey: script,
-                ephemeral: vec![],
             },
         );
-        eph.insert(op, ephemeral);
     }
-    Ok((map, eph))
+    Ok(map)
 }
 
 // --- coinbase.dat: live coinbase outputs and the height they were created at
@@ -936,39 +764,6 @@ fn parse_coinbase(buf: &[u8]) -> Result<HashMap<OutPoint, u64>, String> {
         );
     }
     Ok(map)
-}
-
-// --- burnt.dat: flat list of 20-byte commitments ----------------------------
-
-fn write_burnt(path: &Path, burnt: &HashSet<[u8; 20]>) -> std::io::Result<()> {
-    let mut w = Vec::new();
-    w.extend_from_slice(&(burnt.len() as u32).to_le_bytes());
-    for c in burnt {
-        w.extend_from_slice(c);
-    }
-    fs::write(path, w)
-}
-
-fn parse_burnt(buf: &[u8]) -> Result<HashSet<[u8; 20]>, String> {
-    if buf.len() < 4 {
-        return Err("corrupt burnt file".into());
-    }
-    let mut pos = 0;
-    let mut c = [0u8; 4];
-    c.copy_from_slice(&buf[pos..pos + 4]);
-    pos += 4;
-    let count = u32::from_le_bytes(c) as usize;
-    if buf.len() < 4 + count * 20 {
-        return Err("corrupt burnt file".into());
-    }
-    let mut set = HashSet::new();
-    for _ in 0..count {
-        let mut a = [0u8; 20];
-        a.copy_from_slice(&buf[pos..pos + 20]);
-        pos += 20;
-        set.insert(a);
-    }
-    Ok(set)
 }
 
 // --- chainmeta.dat: (work, applied, pow_ok) for restart-safe chain state ---
@@ -1051,12 +846,6 @@ fn write_undo(path: &Path, undo: &HashMap<Hash32, UndoData>) -> std::io::Result<
             w.extend_from_slice(&out.value.0.to_le_bytes());
             w.extend_from_slice(&(out.script_pubkey.len() as u32).to_le_bytes());
             w.extend_from_slice(&out.script_pubkey);
-            w.extend_from_slice(&(out.ephemeral.len() as u32).to_le_bytes());
-            w.extend_from_slice(&out.ephemeral);
-        }
-        w.extend_from_slice(&(u.burnt.len() as u32).to_le_bytes());
-        for c in &u.burnt {
-            w.extend_from_slice(c);
         }
         w.extend_from_slice(&(u.coinbase_created.len() as u32).to_le_bytes());
         for (op, h) in &u.coinbase_created {
@@ -1118,10 +907,6 @@ fn parse_undo(buf: &[u8]) -> HashMap<Hash32, UndoData> {
             sl.copy_from_slice(take!(4));
             let slen = u32::from_le_bytes(sl) as usize;
             let script = take!(slen).to_vec();
-            let mut el = [0u8; 4];
-            el.copy_from_slice(take!(4));
-            let elen = u32::from_le_bytes(el) as usize;
-            let ephemeral = take!(elen).to_vec();
             spent.push((
                 OutPoint {
                     txid: Hash32(txid),
@@ -1130,17 +915,8 @@ fn parse_undo(buf: &[u8]) -> HashMap<Hash32, UndoData> {
                 TxOut {
                     value: Amount(u64::from_le_bytes(v)),
                     script_pubkey: script,
-                    ephemeral,
                 },
             ));
-        }
-        cu.copy_from_slice(take!(4));
-        let nb = u32::from_le_bytes(cu) as usize;
-        let mut burnt = Vec::new();
-        for _ in 0..nb {
-            let mut c = [0u8; 20];
-            c.copy_from_slice(take!(20));
-            burnt.push(c);
         }
         // Coinbase sections are optional for backward compatibility with undo
         // files written before coinbase maturity existed.
@@ -1192,7 +968,6 @@ fn parse_undo(buf: &[u8]) -> HashMap<Hash32, UndoData> {
             UndoData {
                 created,
                 spent,
-                burnt,
                 coinbase_created,
                 coinbase_spent,
             },
@@ -1254,16 +1029,7 @@ impl FileStore {
         if base.join("utxo.dat").exists() {
             let b =
                 fs::read(base.join("utxo.dat")).map_err(|e| format!("cannot read utxos: {e}"))?;
-            let (map, eph) = parse_utxos(&b)?;
-            inner.utxos = map;
-            inner.utxo_ephemeral = eph;
-        }
-        if base.join("burnt.dat").exists() {
-            let b =
-                fs::read(base.join("burnt.dat")).map_err(|e| format!("cannot read burnt: {e}"))?;
-            for c in parse_burnt(&b)? {
-                inner.burnt.burn(&c);
-            }
+            inner.utxos = parse_utxos(&b)?;
         }
         if base.join("coinbase.dat").exists() {
             let b = fs::read(base.join("coinbase.dat"))
@@ -1304,9 +1070,6 @@ impl FileStore {
     fn utxo_path(&self) -> PathBuf {
         self.base.join("utxo.dat")
     }
-    fn burnt_path(&self) -> PathBuf {
-        self.base.join("burnt.dat")
-    }
     fn coinbase_path(&self) -> PathBuf {
         self.base.join("coinbase.dat")
     }
@@ -1328,14 +1091,8 @@ impl FileStore {
         write_utxos(
             &self.utxo_path(),
             &self.inner.utxos,
-            &self.inner.utxo_ephemeral,
         )
         .map_err(|e| format!("cannot write utxos: {e}"))
-    }
-
-    fn write_burnt(&self) -> Result<(), String> {
-        write_burnt(&self.burnt_path(), self.inner.burnt().commits())
-            .map_err(|e| format!("cannot write burnt: {e}"))
     }
 
     fn write_coinbase(&self) -> Result<(), String> {
@@ -1405,7 +1162,7 @@ impl FileStore {
         Ok(())
     }
 
-    /// Write a *snapshot* of the current live state (UTXO set, burnt keys,
+    /// Write a *snapshot* of the current live state (UTXO set,
     /// coinbase heights, tip, chain work) plus a trustless `snapshot.meta`
     /// describing it. A bootstrapping node can `load_snapshot` and verify the
     /// state purely from `snapshot.meta.state_root` (recomputed over the loaded
@@ -1467,11 +1224,8 @@ impl FileStore {
         write_utxos(
             &dir.join("utxo.dat"),
             &self.inner.utxos,
-            &self.inner.utxo_ephemeral,
         )
         .map_err(|e| format!("snapshot utxo: {e}"))?;
-        write_burnt(&dir.join("burnt.dat"), self.inner.burnt.commits())
-            .map_err(|e| format!("snapshot burnt: {e}"))?;
         write_coinbase(&dir.join("coinbase.dat"), &self.inner.coinbase)
             .map_err(|e| format!("snapshot coinbase: {e}"))?;
         write_meta(
@@ -1545,8 +1299,8 @@ impl ChainStore for FileStore {
 }
 
 impl UtxoStore for FileStore {
-    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut, ephemeral: Vec<u8>) {
-        self.inner.add_utxo(outpoint, output, ephemeral);
+    fn add_utxo(&mut self, outpoint: OutPoint, output: TxOut) {
+        self.inner.add_utxo(outpoint, output);
         let _ = self.write_utxos();
     }
     fn spend_utxo(&mut self, outpoint: &OutPoint) -> Result<TxOut, String> {
@@ -1567,23 +1321,12 @@ impl UtxoStore for FileStore {
     fn find_by_commit(&self, commit: &[u8; 20]) -> Option<OutPoint> {
         self.inner.find_by_commit(commit)
     }
-    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut, Vec<u8>)> {
+    fn iter_utxos(&self) -> Vec<(OutPoint, TxOut)> {
         self.inner.iter_utxos()
     }
 }
 
 impl SpendStore for FileStore {
-    fn mark_spent_once(&mut self, commit: &[u8; 20]) -> Result<(), String> {
-        let r = self.inner.mark_spent_once(commit);
-        if r.is_ok() {
-            let _ = self.write_burnt();
-        }
-        r
-    }
-    fn is_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.inner.burnt().is_burnt(commit)
-    }
-
     fn mark_coinbase(&mut self, op: &OutPoint, height: u64) {
         self.inner.mark_coinbase(op, height);
         let _ = self.write_coinbase();
@@ -1605,7 +1348,6 @@ impl SpendStore for FileStore {
     fn disconnect(&mut self, hash: &Hash32) {
         self.inner.disconnect(hash);
         let _ = self.write_utxos();
-        let _ = self.write_burnt();
         let _ = self.write_coinbase();
         let _ = self.write_undo();
     }
@@ -1650,15 +1392,6 @@ impl state::StateStore for FileStore {
     fn remove_utxo(&mut self, op: &OutPoint) {
         let _ = self.spend_utxo(op);
     }
-    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.inner.get_burnt(commit)
-    }
-    fn mark_burnt(&mut self, commit: [u8; 20]) {
-        let _ = self.mark_spent_once(&commit);
-    }
-    fn iter_burnt(&self) -> Vec<[u8; 20]> {
-        self.inner.iter_burnt()
-    }
     fn root(&self) -> [u8; 32] {
         self.inner.root()
     }
@@ -1698,9 +1431,7 @@ mod snapshot_tests {
             TxOut {
                 value: Amount(5 * 100_000_000),
                 script_pubkey: vec![9u8; 20],
-                ephemeral: vec![],
             },
-            vec![],
         );
         s.mark_coinbase(&op, 0);
         let op2 = OutPoint {
@@ -1712,11 +1443,8 @@ mod snapshot_tests {
             TxOut {
                 value: Amount(100_000_000),
                 script_pubkey: vec![8u8; 20],
-                ephemeral: vec![],
             },
-            vec![],
         );
-        let _ = s.mark_spent_once(&[3u8; 20]);
 
         // Tip block body, so a fast-synced node can still validate the *next*
         // block's header.
@@ -1776,35 +1504,32 @@ mod snapshot_tests {
             TxOut {
                 value: Amount(5 * 100_000_000),
                 script_pubkey: vec![9u8; 20],
-                ephemeral: vec![],
             },
-            vec![],
         );
         live.mark_coinbase(&op, 0);
         live.set_tip(Hash32([0u8; 32]), 0);
         live.set_work(Hash32([0u8; 32]), 1);
 
         // "Mine" a chain of blocks simply by recording tip transitions and the
-        // evolving UTXO set. (We don't run PoW here — the snapshot/fast-sync path
-        // is what we exercise.) Each block spends the funded output forward.
+        // evolving UTXO set. Each block spends the funded output forward.
         let mut tip = Hash32([0u8; 32]);
         let mut height = 0u64;
         for i in 1..=5u64 {
-            let kp = wots_keypair_for_test(i);
+            let seed = i.to_be_bytes();
+            let mut pkh = [0u8; 20];
+            pkh[..8].copy_from_slice(&seed);
             let tx = Transaction {
                 version: 1,
                 inputs: vec![TxIn {
                     prevout: op.clone(),
-                    scheme: SignatureScheme::Wots256,
-                    script_sig: vec![], // value-only forward spend; sig not checked by store
+                    scheme: SignatureScheme::Mldsa2,
+                    script_sig: vec![],
                     sequence: 0xFFFF_FFFF,
                 }],
                 outputs: vec![TxOut {
                     value: Amount(1_000_000),
-                    script_pubkey: kp.pubkey_root_hash160().to_vec(),
-                    ephemeral: vec![],
+                    script_pubkey: pkh.to_vec(),
                 }],
-                ephemeral: vec![],
                 lock_time: 0,
             };
             let header = BlockHeader {
@@ -1835,10 +1560,8 @@ mod snapshot_tests {
                 new_op.clone(),
                 TxOut {
                     value: Amount(1_000_000),
-                    script_pubkey: kp.pubkey_root_hash160().to_vec(),
-                    ephemeral: vec![],
+                    script_pubkey: pkh.to_vec(),
                 },
-                vec![],
             );
             tip = h;
             height = i;
@@ -1860,25 +1583,25 @@ mod snapshot_tests {
         assert!(synced.utxo(&carried).is_some());
 
         // Continuing the chain past the snapshot works: append block 6.
-        let kp = wots_keypair_for_test(6);
         let new_op = OutPoint {
             txid: tip,
             index: 0,
         };
+        let seed = 6u64.to_be_bytes();
+        let mut pkh = [0u8; 20];
+        pkh[..8].copy_from_slice(&seed);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 prevout: new_op.clone(),
-                scheme: SignatureScheme::Wots256,
+                scheme: SignatureScheme::Mldsa2,
                 script_sig: vec![],
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![TxOut {
                 value: Amount(500_000),
-                script_pubkey: kp.pubkey_root_hash160().to_vec(),
-                ephemeral: vec![],
+                script_pubkey: pkh.to_vec(),
             }],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let header = BlockHeader {
@@ -1901,12 +1624,5 @@ mod snapshot_tests {
         synced.set_work(h, 7);
         assert_eq!(synced.tip(), Some(h));
         assert_eq!(synced.height_of(&h), Some(6));
-    }
-
-    /// Small helper: a deterministic keypair for the e2e test (no network use).
-    fn wots_keypair_for_test(i: u64) -> litc_primitives::wots::WotsKeypair {
-        let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&i.to_be_bytes());
-        litc_primitives::wots::WotsKeypair::derive(&seed, 0)
     }
 }

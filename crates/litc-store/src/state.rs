@@ -1,7 +1,7 @@
 //! Consensus state abstraction and in-memory implementations.
 //!
-//! `StateRoot` is a pure function of the live consensus state: the UTXO set and
-//! the set of burnt WOTS+ commitments. By design it MUST NOT depend on:
+//! `StateRoot` is a pure function of the live consensus state: the UTXO set.
+//! By design it MUST NOT depend on:
 //! insertion order, `HashMap` iteration order, timestamps, caches, peers,
 //! mempool, or the filesystem layout. See `docs/state.md`.
 //!
@@ -21,20 +21,15 @@ pub struct UtxoEntry {
 }
 
 /// The portion of chain state that validation depends on: the unspent output
-/// set and the one-time-use ("burnt") WOTS+ commitment index. Abstracted so the
-/// rest of the code does not care whether state lives in memory, an overlay, a
-/// snapshot, or a database.
+/// set. Abstracted so the rest of the code does not care whether state lives
+/// in memory, an overlay, a snapshot, or a database.
 pub trait StateStore {
     fn get_utxo(&self, op: &OutPoint) -> Option<UtxoEntry>;
     fn put_utxo(&mut self, op: OutPoint, entry: UtxoEntry);
     fn remove_utxo(&mut self, op: &OutPoint);
-    fn get_burnt(&self, commit: &[u8; 20]) -> bool;
-    fn mark_burnt(&mut self, commit: [u8; 20]);
-    /// Full set of burnt commitments (for `root` and snapshots).
-    fn iter_burnt(&self) -> Vec<[u8; 20]>;
     /// Determinstic root committing to the full live state. See module docs.
     fn root(&self) -> [u8; 32];
-    /// All unspent outputs (used by the wallet to scan for stealth payments).
+    /// All unspent outputs.
     fn iter_utxos(&self) -> Vec<(OutPoint, UtxoEntry)>;
 }
 
@@ -50,19 +45,12 @@ pub fn utxo_key(op: &OutPoint) -> [u8; 32] {
     sha256d(&buf).0
 }
 
-/// 32-byte SMT key for a burnt commitment: `H(commit)`.
-pub fn burnt_key(commit: &[u8; 20]) -> [u8; 32] {
-    sha256d(commit).0
-}
-
-/// Canonical leaf value for a UTXO entry (value, script, ephemeral, coinbase).
+/// Canonical leaf value for a UTXO entry (value, script, coinbase).
 fn utxo_leaf_value(entry: &UtxoEntry) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&entry.output.value.0.to_le_bytes());
     b.extend_from_slice(&(entry.output.script_pubkey.len() as u32).to_le_bytes());
     b.extend_from_slice(&entry.output.script_pubkey);
-    b.extend_from_slice(&(entry.output.ephemeral.len() as u32).to_le_bytes());
-    b.extend_from_slice(&entry.output.ephemeral);
     b.push(if entry.coinbase_height.is_some() { 1 } else { 0 });
     if let Some(h) = entry.coinbase_height {
         b.extend_from_slice(&h.to_le_bytes());
@@ -119,13 +107,10 @@ fn build(leaves: &[([u8; 32], Vec<u8>)], depth: usize) -> [u8; 32] {
 }
 
 /// Canonical, order-independent `state_root` from the consensus state.
-pub(crate) fn state_root_of(utxos: Vec<(OutPoint, UtxoEntry)>, burnt: Vec<[u8; 20]>) -> [u8; 32] {
+pub(crate) fn state_root_of(utxos: Vec<(OutPoint, UtxoEntry)>) -> [u8; 32] {
     let mut u: Vec<([u8; 32], Vec<u8>)> =
         utxos.iter().map(|(op, e)| (utxo_key(op), utxo_leaf_value(e))).collect();
-    let mut b: Vec<([u8; 32], Vec<u8>)> = burnt.iter().map(|c| (burnt_key(c), Vec::new())).collect();
-    let ur = smt_root(&mut u);
-    let br = smt_root(&mut b);
-    sha256d(&[ur, br].concat()).0
+    smt_root(&mut u)
 }
 
 /// In-memory `StateStore`. Suitable for tests, ephemeral nodes, and as the
@@ -133,7 +118,6 @@ pub(crate) fn state_root_of(utxos: Vec<(OutPoint, UtxoEntry)>, burnt: Vec<[u8; 2
 #[derive(Clone, Default)]
 pub struct MemoryState {
     utxos: HashMap<OutPoint, UtxoEntry>,
-    burnt: HashSet<[u8; 20]>,
 }
 
 impl MemoryState {
@@ -141,11 +125,8 @@ impl MemoryState {
         Self::default()
     }
 
-    pub fn from_parts(
-        utxos: HashMap<OutPoint, UtxoEntry>,
-        burnt: HashSet<[u8; 20]>,
-    ) -> Self {
-        Self { utxos, burnt }
+    pub fn from_parts(utxos: HashMap<OutPoint, UtxoEntry>) -> Self {
+        Self { utxos }
     }
 }
 
@@ -159,22 +140,13 @@ impl StateStore for MemoryState {
     fn remove_utxo(&mut self, op: &OutPoint) {
         self.utxos.remove(op);
     }
-    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.burnt.contains(commit)
-    }
-    fn mark_burnt(&mut self, commit: [u8; 20]) {
-        self.burnt.insert(commit);
-    }
-    fn iter_burnt(&self) -> Vec<[u8; 20]> {
-        self.burnt.iter().copied().collect()
-    }
     fn root(&self) -> [u8; 32] {
         let utxos: Vec<(OutPoint, UtxoEntry)> = self
             .utxos
             .iter()
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
-        state_root_of(utxos, self.iter_burnt())
+        state_root_of(utxos)
     }
     fn iter_utxos(&self) -> Vec<(OutPoint, UtxoEntry)> {
         self.utxos
@@ -195,7 +167,6 @@ pub struct OverlayState<'a, S: StateStore> {
     base: &'a mut S,
     puts: HashMap<OutPoint, UtxoEntry>,
     removes: HashSet<OutPoint>,
-    burnt_adds: HashSet<[u8; 20]>,
 }
 
 impl<'a, S: StateStore> OverlayState<'a, S> {
@@ -204,7 +175,6 @@ impl<'a, S: StateStore> OverlayState<'a, S> {
             base,
             puts: HashMap::new(),
             removes: HashSet::new(),
-            burnt_adds: HashSet::new(),
         }
     }
 
@@ -217,12 +187,9 @@ impl<'a, S: StateStore> OverlayState<'a, S> {
         for (op, e) in self.puts {
             base.put_utxo(op, e);
         }
-        for c in self.burnt_adds {
-            base.mark_burnt(c);
-        }
     }
 
-    fn merged(&self) -> (Vec<(OutPoint, UtxoEntry)>, Vec<[u8; 20]>) {
+    fn merged(&self) -> Vec<(OutPoint, UtxoEntry)> {
         let mut utxos: Vec<(OutPoint, UtxoEntry)> = Vec::new();
         for (op, e) in self.base.iter_utxos() {
             if !self.removes.contains(&op) {
@@ -232,13 +199,7 @@ impl<'a, S: StateStore> OverlayState<'a, S> {
         for (op, e) in &self.puts {
             utxos.push((op.clone(), e.clone()));
         }
-        let mut burnt = self.base.iter_burnt();
-        for c in &self.burnt_adds {
-            if !burnt.contains(c) {
-                burnt.push(*c);
-            }
-        }
-        (utxos, burnt)
+        utxos
     }
 }
 
@@ -260,27 +221,12 @@ impl<'a, S: StateStore> StateStore for OverlayState<'a, S> {
         self.puts.remove(op);
         self.removes.insert(op.clone());
     }
-    fn get_burnt(&self, commit: &[u8; 20]) -> bool {
-        self.burnt_adds.contains(commit) || self.base.get_burnt(commit)
-    }
-    fn mark_burnt(&mut self, commit: [u8; 20]) {
-        self.burnt_adds.insert(commit);
-    }
-    fn iter_burnt(&self) -> Vec<[u8; 20]> {
-        let mut b = self.base.iter_burnt();
-        for c in &self.burnt_adds {
-            if !b.contains(c) {
-                b.push(*c);
-            }
-        }
-        b
-    }
     fn root(&self) -> [u8; 32] {
-        let (utxos, burnt) = self.merged();
-        state_root_of(utxos, burnt)
+        let utxos = self.merged();
+        state_root_of(utxos)
     }
     fn iter_utxos(&self) -> Vec<(OutPoint, UtxoEntry)> {
-        self.merged().0
+        self.merged()
     }
 }
 
@@ -303,7 +249,6 @@ mod tests {
             output: TxOut {
                 value: Amount(value),
                 script_pubkey: vec![0u8; 20],
-                ephemeral: Vec::new(),
             },
             coinbase_height: cb,
         }
@@ -315,10 +260,8 @@ mod tests {
         a.put_utxo(op(1, 0), entry(10, None));
         a.put_utxo(op(2, 0), entry(20, Some(0)));
         a.put_utxo(op(3, 1), entry(30, None));
-        a.mark_burnt([7u8; 20]);
 
         let mut b = MemoryState::new();
-        b.mark_burnt([7u8; 20]);
         b.put_utxo(op(3, 1), entry(30, None));
         b.put_utxo(op(1, 0), entry(10, None));
         b.put_utxo(op(2, 0), entry(20, Some(0)));
@@ -333,7 +276,6 @@ mod tests {
         direct.put_utxo(op(2, 0), entry(50, None));
         direct.remove_utxo(&op(1, 0));
         direct.put_utxo(op(3, 0), entry(70, None));
-        direct.mark_burnt([9u8; 20]);
 
         let mut base = MemoryState::new();
         base.put_utxo(op(1, 0), entry(100, Some(0)));
@@ -341,7 +283,6 @@ mod tests {
         ov.remove_utxo(&op(1, 0));
         ov.put_utxo(op(2, 0), entry(50, None));
         ov.put_utxo(op(3, 0), entry(70, None));
-        ov.mark_burnt([9u8; 20]);
 
         assert_eq!(ov.root(), direct.root());
 
@@ -350,24 +291,18 @@ mod tests {
         assert_eq!(base.get_utxo(&op(1, 0)), None);
         assert_eq!(base.get_utxo(&op(2, 0)), Some(entry(50, None)));
         assert_eq!(base.get_utxo(&op(3, 0)), Some(entry(70, None)));
-        assert!(base.get_burnt(&[9u8; 20]));
     }
 
     #[test]
     fn overlay_merges_base_and_changes() {
         let mut base = MemoryState::new();
         base.put_utxo(op(1, 0), entry(100, Some(0)));
-        base.mark_burnt([1u8; 20]);
 
         let mut ov = OverlayState::new(&mut base);
         ov.put_utxo(op(2, 0), entry(5, None));
         ov.remove_utxo(&op(1, 0));
-        ov.mark_burnt([2u8; 20]);
 
         assert_eq!(ov.get_utxo(&op(1, 0)), None);
         assert_eq!(ov.get_utxo(&op(2, 0)), Some(entry(5, None)));
-        assert!(ov.get_burnt(&[1u8; 20]));
-        assert!(ov.get_burnt(&[2u8; 20]));
-        assert!(!ov.get_burnt(&[3u8; 20]));
     }
 }
