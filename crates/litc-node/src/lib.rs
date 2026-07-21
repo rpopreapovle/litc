@@ -575,9 +575,18 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
     listen: SocketAddr,
     connecting: &AddrSet,
 ) {
-    if peers.lock().unwrap().contains_key(&addr) || !connecting.lock().unwrap().insert(addr) {
-        return;
+    {
+        let p = peers.lock().unwrap();
+        if p.contains_key(&addr) {
+            eprintln!("[p2p] connect_to skip {addr} (already in peers)");
+            return;
+        }
+        if !connecting.lock().unwrap().insert(addr) {
+            eprintln!("[p2p] connect_to skip {addr} (already connecting)");
+            return;
+        }
     }
+    eprintln!("[p2p] connect_to proceed {addr}");
     let cn = connecting.clone();
     thread::spawn(
         move || match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
@@ -696,9 +705,13 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 }
             }
             // Connect to any newly-learned addresses we aren't already peered with.
+            for sa in &new_peers {
+                eprintln!("[p2p] Addr handler: new_peer={sa}");
+            }
             for sa in new_peers {
                 let already = peers.lock().unwrap().contains_key(&sa);
                 if !already {
+                    eprintln!("[p2p] Addr handler -> connect_to {sa}");
                     connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
                 }
             }
@@ -1139,6 +1152,9 @@ pub fn run(args: Vec<String>) {
         }
     });
 
+    for addr in &connect_targets {
+        eprintln!("[p2p] connect_targets: {addr}");
+    }
     for addr in connect_targets {
         let p = peers.clone();
         let nd = node.clone();
