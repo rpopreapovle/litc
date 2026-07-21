@@ -355,17 +355,14 @@ impl<S: SpendStore + StateStore> Node<S> {
         }
         let target = self.target_for(height);
         if !validate_block_pow_merkle(&block, &target) {
-            eprintln!("reject block {}: pow/merkle", hex(&hash.0[..4]));
             return false;
         }
         if validate_block_header(&block, &self.store).is_err() {
-            eprintln!("reject block {}: header", hex(&hash.0[..4]));
             return false;
         }
         // A block at a checkpoint height must carry the pinned hash; this
         // finalizes history at/below the checkpoint and bounds snapshot trust.
         if validate_checkpoint(&block, &self.params).is_err() {
-            eprintln!("reject block {}: checkpoint", hex(&hash.0[..4]));
             return false;
         }
         peer_rate_record(&mut self.peer_block, &from);
@@ -823,6 +820,21 @@ fn miner_loop<S: SpendStore + StateStore>(
     miner: Box<dyn MinerBackend + Send>,
 ) {
     let codec = Codec::new(node.lock().unwrap().params.magic);
+    // If the chain is empty, wait for the first block from the network before
+    // mining our own genesis — avoids mining orphan blocks on first start.
+    {
+        let n = node.lock().unwrap();
+        if n.best_height() == 0 && n.tip == Hash32([0u8; 32]) {
+            drop(n);
+            for _ in 0..10 {
+                thread::sleep(Duration::from_secs(1));
+                let n = node.lock().unwrap();
+                if n.best_height() > 0 || !peers.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+        }
+    }
     loop {
         let (template, target) = {
             let mut n = node.lock().unwrap();
