@@ -333,7 +333,8 @@ impl<S: SpendStore + StateStore> Node<S> {
             return false;
         }
         // Per-peer block rate limit (DoS guard against header-rain attacks).
-        if !peer_rate_allowed(&mut self.peer_block, &from, PEER_BLOCK_WINDOW, PEER_BLOCK_LIMIT) {
+        // Skip for locally mined blocks.
+        if from != LOCAL && !peer_rate_allowed(&mut self.peer_block, &from, PEER_BLOCK_WINDOW, PEER_BLOCK_LIMIT) {
             eprintln!("[p2p] peer {from} exceeded block rate limit");
             return false;
         }

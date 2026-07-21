@@ -277,9 +277,6 @@ pub fn block_work(target: &[u8; 32]) -> u128 {
             quot[qidx] |= 1u64 << qoff;
         }
     }
-    eprintln!("DEBUG block_work quot=[{:#x},{:#x},{:#x},{:#x},{:#x}] rem=[{:#x},{:#x},{:#x},{:#x},{:#x}]",
-        quot[0], quot[1], quot[2], quot[3], quot[4],
-        rem[0], rem[1], rem[2], rem[3], rem[4]);
     ((quot[1] as u128) << 64) | (quot[0] as u128)
 }
 
