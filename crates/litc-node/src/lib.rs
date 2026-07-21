@@ -133,6 +133,17 @@ const PEER_BLOCK_LIMIT: usize = 200;
 /// directory), which is trusted and not rate-limited in the same way.
 const LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
 
+/// A worker registered with the built-in mining pool.
+#[derive(Clone)]
+pub(crate) struct PoolWorker {
+    pub addr: SocketAddr,
+    pub name: String,
+    pub blocks_found: u64,
+    pub shares: u64,
+    /// Last block height this worker submitted a share/block for.
+    pub last_height: u64,
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -198,6 +209,8 @@ pub(crate) struct Node<S: SpendStore + StateStore> {
     epoch_targets: Vec<[u8; 32]>,
     /// Best-chain block hash + timestamp, indexed by height.
     pub(crate) chain: HashMap<u64, (Hash32, u64)>,
+    /// Mining pool workers.
+    pub(crate) pool_workers: Vec<PoolWorker>,
 }
 
 impl<S: SpendStore + StateStore> Node<S> {
@@ -220,6 +233,7 @@ impl<S: SpendStore + StateStore> Node<S> {
             epoch_targets: vec![INITIAL_TARGET],
             chain: HashMap::new(),
             params,
+            pool_workers: Vec::new(),
         };
         // Rebuild the best-chain index so sync/relay work immediately after a
         // restart (the store already loaded its tip from disk).
@@ -256,7 +270,7 @@ impl<S: SpendStore + StateStore> Node<S> {
         }
     }
 
-    fn make_template(&mut self) -> (BlockTemplate, [u8; 32]) {
+    pub(crate) fn make_template(&mut self) -> (BlockTemplate, [u8; 32]) {
         let height = self.best_height();
         let seed = if height.is_multiple_of(EPOCH_BLOCKS) {
             if height == 0 {

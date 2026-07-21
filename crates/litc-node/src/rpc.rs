@@ -272,11 +272,63 @@ fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -
         Err(_) => return err(-5, "invalid block encoding", id),
     };
     let from = "0.0.0.0:0".parse().unwrap();
-    if node.accept_block(block, from) {
-        ok(json!(true), id)
-    } else {
-        err(-25, "block rejected", id)
+    if !node.accept_block(block, from) {
+        return err(-25, "block rejected", id);
     }
+    // Track the submitter in the pool.
+    let worker_name = params.get(1).and_then(|v| v.as_str()).unwrap_or("anon").to_string();
+    let addr = from;
+    let height = node.best_height();
+    if let Some(w) = node.pool_workers.iter_mut().find(|w| w.name == worker_name) {
+        w.blocks_found += 1;
+        w.last_height = height;
+    } else {
+        node.pool_workers.push(crate::PoolWorker {
+            addr,
+            name: worker_name,
+            blocks_found: 1,
+            shares: 0,
+            last_height: height,
+        });
+    }
+    ok(json!(true), id)
+}
+
+fn handle_getblocktemplate(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
+    // Track the requestor as a pool worker.
+    let worker_name = params.get(0).and_then(|v| v.as_str()).unwrap_or("anon").to_string();
+    let addr = "0.0.0.0:0".parse().unwrap();
+    if !node.pool_workers.iter().any(|w| w.name == worker_name) {
+        node.pool_workers.push(crate::PoolWorker {
+            addr,
+            name: worker_name,
+            blocks_found: 0,
+            shares: 0,
+            last_height: 0,
+        });
+    }
+    let (template, target) = node.make_template();
+    let header_nonce0 = to_bytes(&crate::assemble_block(&template).header);
+    ok(json!({
+        "height": template.height,
+        "header_hex": hex::encode(&header_nonce0),
+        "target_hex": hex::encode(&target),
+        "prev_block": template.prev_block.to_hex(),
+        "epoch_seed": template.epoch_seed.to_hex(),
+        "state_root": template.state_root.to_hex(),
+        "coinbase_value": template.coinbase_value.0,
+    }), id)
+}
+
+fn handle_getpoolinfo(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
+    let workers: Vec<Value> = node.pool_workers.iter().map(|w| json!({
+        "name": w.name,
+        "addr": w.addr.to_string(),
+        "blocks_found": w.blocks_found,
+        "shares": w.shares,
+        "last_height": w.last_height,
+    })).collect();
+    ok(json!({"workers": workers, "total_workers": workers.len()}), id)
 }
 
 fn handle_getpeerinfo(_node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id: Value) -> String {
@@ -463,9 +515,17 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_getmininginfo(&n, &req.params, id)
         }
+        "getblocktemplate" => {
+            let mut n = node.lock().unwrap();
+            handle_getblocktemplate(&mut n, &req.params, id)
+        }
         "submitblock" => {
             let mut n = node.lock().unwrap();
             handle_submitblock(&mut n, &req.params, id)
+        }
+        "getpoolinfo" => {
+            let n = node.lock().unwrap();
+            handle_getpoolinfo(&n, &req.params, id)
         }
         "getpeerinfo" => {
             let n = node.lock().unwrap();
