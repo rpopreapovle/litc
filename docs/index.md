@@ -60,7 +60,9 @@ litc/
 - [protocol.md](protocol.md) — binary P2P wire format.
 - [mining.md](mining.md) — algorithm and commodity hardware.
 - [pow.md](pow.md) — LiteHash design.
-- [wots.md](wots.md) — WOTS+ signatures.
+- [wots.md](wots.md) — WOTS+ signatures (legacy).
+- [stealth.md](stealth.md) — stealth address protocol (legacy).
+- [ml-dsa-migration.md](ml-dsa-migration.md) — ML-DSA-2 migration plan.
 - [benchmarks.md](benchmarks.md) — hardware measurements.
 - [running-a-node.md](running-a-node.md) — build, configure, run.
 - [wallet.md](wallet.md) — keys, backup, transfers.

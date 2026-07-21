@@ -133,3 +133,31 @@ pinned as a checkpoint at testnet launch.
 - **Stage 19 — Throughput benchmark** for WOTS+ `w=256` (already active) and
   tx/s under block validation. WOTS+ witness/throughput numbers added to
   `docs/benchmarks.md` (DONE).
+
+## Stage 20 — ML-DSA-2 migration (Dilithium, FIPS 204)
+
+Replace WOTS+ + ML-KEM with ML-DSA-2 as the sole signature scheme.
+Pre-mainnet breaking change. See [ml-dsa-migration.md](ml-dsa-migration.md).
+
+**Why:** ~1300-char stealth addresses → ~40-char `litc1q...` addresses.
+Reusable stateless keys. Simpler wallet (no stealth scan, no KEM, no burnt
+keys). ~13% smaller transactions. Same post-quantum security class.
+
+### Phase 1 — Add ML-DSA-2 alongside WOTS+
+1. Add `pqcrypto-dilithium` crate to `litc-primitives`.
+2. Create `mldsa.rs`: keygen, sign, verify, address encoding.
+3. Add `Mldsa2 = 1` to `SignatureScheme` enum.
+4. Unit tests: roundtrip, address format, sighash binding.
+5. `validate_tx` recognizes but rejects `Mldsa2` (inactive).
+
+### Phase 2 — Fork activation
+1. Activate `Mldsa2` at a specific testnet block height.
+2. `Wots256` becomes invalid for new transactions at fork height.
+3. Existing WOTS+ UTXOs remain spendable (migration window).
+4. `litc-cli wallet new` defaults to ML-DSA-2.
+5. `litc-cli wallet send` uses ML-DSA-2 signatures.
+
+### Phase 3 — Prune legacy
+1. After migration window (~1000 blocks), reject new WOTS+ spends.
+2. Remove WOTS+ verification from `validate_tx`.
+3. Archive `wots.md`, `stealth.md`.
