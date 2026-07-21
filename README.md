@@ -87,6 +87,7 @@ crates/
   litc-miner-gpu-wgpu Optional wgpu GPU mining backend
   litc-node           P2P node + RPC API + miner driver
   litc-cli            Command-line client
+  litc-lightwallet    Light wallet library (offline signing + server RPC)
   litc-ffi            C API for embeddings / bindings
 docs/                 Protocol, PoW, WOTS+, stealth, CLI, RPC, roadmap
 ```

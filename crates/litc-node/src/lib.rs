@@ -445,7 +445,7 @@ impl<S: SpendStore + StateStore> Node<S> {
         inv
     }
 
-    fn accept_tx(&mut self, tx: Transaction, from: SocketAddr) -> bool {
+    pub(crate) fn accept_tx(&mut self, tx: Transaction, from: SocketAddr) -> bool {
         let id = tx.txid();
         if self.known_txs.contains(&id) {
             return false;
@@ -917,6 +917,7 @@ pub fn run(args: Vec<String>) {
     let mut save_snapshot: Option<String> = None;
     let mut network = Network::Testnet;
     let mut rpc_port: Option<u16> = None;
+    let mut rpc_bind: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -932,6 +933,14 @@ pub fn run(args: Vec<String>) {
                 if let Some(s) = args.get(i + 1) {
                     if let Ok(p) = s.parse() {
                         rpc_port = Some(p);
+                    }
+                }
+                i += 2;
+            }
+            "--rpc-bind" => {
+                if let Some(s) = args.get(i + 1) {
+                    if let Ok(p) = s.parse() {
+                        rpc_bind = p;
                     }
                 }
                 i += 2;
@@ -1122,7 +1131,8 @@ pub fn run(args: Vec<String>) {
             .open_or_create()
             .expect("keystore for rpc");
         let rpc_peers = peers.clone();
-        thread::spawn(move || rpc::start(rpc_port, rpc_node, rpc_seed, rpc_peers));
+        let rpc_addr = (rpc_bind, rpc_port).into();
+        thread::spawn(move || rpc::start(rpc_addr, rpc_node, rpc_seed, rpc_peers));
     }
 
     loop {

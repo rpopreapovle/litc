@@ -1,0 +1,17 @@
+[package]
+name = "litc-lightwallet"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+litc-primitives = { path = "../litc-primitives" }
+litc-wallet = { path = "../litc-wallet" }
+litc-core = { path = "../litc-core" }
+litc-keystore = { path = "../litc-keystore" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["json"] }

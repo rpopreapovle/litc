@@ -8,9 +8,9 @@ use serde_json::{json, Value};
 
 use litc_keystore::FileKeyStore;
 use litc_primitives::{
-    base58check_decode, to_bytes, Amount, Block, Decodable, Hash32, Reader, COIN,
+    base58check_decode, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
 };
-use litc_store::{BlockStore, FileStore, UtxoStore};
+use litc_store::{BlockStore, FileStore, SpendStore, UtxoStore};
 use litc_wallet::Wallet;
 
 use crate::{write_tx, Node, PeerMap};
@@ -363,6 +363,123 @@ fn handle_getconnectioncount(_node: &Node<FileStore>, peers: &PeerMap, _params: 
     ok(json!(peers.lock().unwrap().len()), id)
 }
 
+fn handle_get_utxos(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
+    let commits: Vec<String> = match params.get(0) {
+        Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        _ => return err(-32602, "expected array of hex commitments", id),
+    };
+    // Build a set of commits to filter on.
+    let targets: Vec<Option<[u8; 20]>> = commits.iter().map(|h| {
+        let b = hex::decode(h).ok()?;
+        if b.len() != 20 { return None; }
+        let mut c = [0u8; 20];
+        c.copy_from_slice(&b);
+        Some(c)
+    }).collect();
+    let mut results = Vec::new();
+    for (op, out, ephemeral) in node.store.iter_utxos() {
+        let Ok(commit) = <[u8; 20]>::try_from(out.script_pubkey.as_slice()) else {
+            continue;
+        };
+        if !targets.iter().any(|t| t.as_ref().map_or(false, |t| t == &commit)) {
+            continue;
+        }
+        let height = node.store.coinbase_height(&op).unwrap_or(0);
+        results.push(json!({
+            "txid": op.txid.to_hex(),
+            "vout": op.index,
+            "value": out.value.0,
+            "commit": hex::encode(out.script_pubkey),
+            "height": height,
+            "ephemeral": hex::encode(&ephemeral),
+        }));
+    }
+    ok(json!(results), id)
+}
+
+fn handle_get_tx(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
+    let txid_hex = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let txid = match hash32_from_hex(txid_hex) {
+        Some(h) => h,
+        None => return err(-5, "invalid txid", id),
+    };
+    // Check mempool first.
+    for tx in &node.mempool {
+        if tx.txid() == txid {
+            return ok(json!({
+                "hex": hex::encode(to_bytes(tx)),
+                "confirmations": 0,
+            }), id);
+        }
+    }
+    // Walk the best chain backwards to find the tx.
+    let mut cur = node.tip;
+    let tip_height = node.best_height();
+    while cur.0 != [0u8; 32] {
+        if let Some(block) = node.store.get_block(&cur) {
+            for tx in &block.txs {
+                if tx.txid() == txid {
+                    let confirmations = tip_height.saturating_sub(block.header.height) + 1;
+                    return ok(json!({
+                        "hex": hex::encode(to_bytes(tx)),
+                        "confirmations": confirmations,
+                    }), id);
+                }
+            }
+            cur = block.header.prev_block;
+        } else {
+            break;
+        }
+    }
+    err(-5, "transaction not found", id)
+}
+
+fn handle_broadcast_raw_tx(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
+    let hex_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(_) => return err(-5, "invalid hex", id),
+    };
+    let tx = match Transaction::decode(&mut Reader::new(&bytes)) {
+        Ok(t) => t,
+        Err(_) => return err(-5, "invalid tx encoding", id),
+    };
+    let from: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    if !node.accept_tx(tx.clone(), from) {
+        return err(-25, "transaction rejected", id);
+    }
+    write_tx(&tx);
+    ok(json!(tx.txid().to_hex()), id)
+}
+
+fn handle_get_header_by_height(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
+    let height = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+    let hash = match node.chain.get(&height) {
+        Some((h, _)) => *h,
+        None => return err(-5, "height out of range", id),
+    };
+    let block = match node.store.get_block(&hash) {
+        Some(b) => b,
+        None => return err(-5, "block not found", id),
+    };
+    ok(json!({
+        "hex": hex::encode(to_bytes(&block.header)),
+        "hash": hash.to_hex(),
+        "height": height,
+    }), id)
+}
+
+fn handle_get_network_params(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
+    ok(json!({
+        "version": 1,
+        "subsidy": litc_core::block_subsidy(node.best_height()).0,
+        "halving_interval": litc_core::HALVING_INTERVAL,
+        "coinbase_maturity": litc_core::COINBASE_MATURITY,
+        "target_interval": 15,
+        "decimals": 8,
+    }), id)
+}
+
 fn handle_request(
     node: &Arc<Mutex<Node<FileStore>>>,
     ks: &FileKeyStore,
@@ -437,6 +554,26 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_getconnectioncount(&n, peers, &req.params, id)
         }
+        "get_utxos" => {
+            let n = node.lock().unwrap();
+            handle_get_utxos(&n, &req.params, id)
+        }
+        "get_tx" => {
+            let n = node.lock().unwrap();
+            handle_get_tx(&n, &req.params, id)
+        }
+        "broadcast_raw_tx" => {
+            let mut n = node.lock().unwrap();
+            handle_broadcast_raw_tx(&mut n, &req.params, id)
+        }
+        "get_header_by_height" => {
+            let n = node.lock().unwrap();
+            handle_get_header_by_height(&n, &req.params, id)
+        }
+        "get_network_params" => {
+            let n = node.lock().unwrap();
+            handle_get_network_params(&n, &req.params, id)
+        }
         _ => err(-32601, &format!("method not found: {}", req.method), id),
     }
 }
@@ -506,16 +643,16 @@ fn write_response(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
 }
 
 pub fn start(
-    port: u16,
+    bind_addr: std::net::SocketAddr,
     node: Arc<Mutex<Node<FileStore>>>,
     wallet_seed: [u8; 32],
     peers: PeerMap,
 ) {
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let addr = bind_addr;
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[rpc] cannot bind port {port}: {e}");
+            eprintln!("[rpc] cannot bind {addr}: {e}");
             return;
         }
     };

@@ -13,6 +13,7 @@ members = [
     "crates/litc-miner-gpu-wgpu",
     "crates/litc-cli",
     "crates/litc-ffi",
+    "crates/litc-lightwallet",
 ]
 
 [workspace.package]
