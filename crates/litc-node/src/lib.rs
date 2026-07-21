@@ -29,7 +29,7 @@ use litc_pow::{
     adjust_target, block_work, EPOCH_BLOCKS, INITIAL_TARGET, TARGET_TIMESPAN,
 };
 use litc_primitives::{
-    sha256d, to_bytes, Block, Decodable, Hash32, Reader, Transaction,
+    sha256d, stealth, to_bytes, Block, Decodable, Hash32, Reader, Transaction,
 };
 use litc_primitives::chainparams::{ChainParams, Network};
 use litc_store::state::StateStore;
@@ -267,17 +267,19 @@ impl<S: SpendStore + StateStore> Node<S> {
         } else {
             self.epoch_seed
         };
-        let coinbase_idx = self.wallet.next_unused_index(&self.store, 1);
-        let coinbase_commit = self.wallet.commitment_at(coinbase_idx);
         let target = self.target_for(height);
         let txs = self.valid_mempool_txs();
+        let coinbase_value = block_subsidy_with(height, self.params.halving_interval);
+        let (kem_pk, _) = self.wallet.kem_keypair();
+        let (txout, ct) = stealth::build_stealth_output(&kem_pk, coinbase_value);
         let mut template = BlockTemplate {
             prev_block: self.tip,
             height,
             timestamp: now_secs(),
             epoch_seed: Hash32(seed),
-            coinbase_commit,
-            coinbase_value: block_subsidy_with(height, self.params.halving_interval),
+            coinbase_value,
+            coinbase_script: txout.script_pubkey,
+            coinbase_ephemeral: ct.to_vec(),
             txs,
             state_root: Hash32([0u8; 32]),
         };

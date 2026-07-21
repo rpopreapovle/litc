@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use litc_keystore::FileKeyStore;
 use litc_primitives::{
-    base58check_decode, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
+    to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
 };
 use litc_store::{BlockStore, FileStore, SpendStore, UtxoStore};
 use litc_wallet::Wallet;
@@ -87,30 +87,6 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 
 fn format_amount(amt: u64) -> String {
     format!("{}.{:08} LIT", amt / COIN, amt % COIN)
-}
-
-fn commit_from_address(a: &str) -> Result<[u8; 20], String> {
-    let (_v, payload) = base58check_decode(a).ok_or_else(|| "bad address".to_string())?;
-    if payload.len() != 20 {
-        return Err("address must encode a 20-byte commitment".into());
-    }
-    let mut c = [0u8; 20];
-    c.copy_from_slice(&payload);
-    Ok(c)
-}
-
-fn get_balance_for_wallet(store: &impl UtxoStore, w: &Wallet) -> u64 {
-    let mut total = 0u64;
-    for (op, out, _eph) in UtxoStore::iter_utxos(store) {
-        for i in 0..=1_000_000u32 {
-            let c = w.commitment_at(i);
-            if UtxoStore::find_by_commit(store, &c).map(|found| found == op).unwrap_or(false) {
-                total += out.value.0;
-                break;
-            }
-        }
-    }
-    total
 }
 
 fn handle_getblockcount(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
@@ -195,22 +171,12 @@ fn handle_getinfo(node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id
 }
 
 fn handle_getbalance(node: &Node<FileStore>, w: &Wallet, ks: &FileKeyStore, _params: &[Value], id: Value) -> String {
-    let legacy = get_balance_for_wallet(&node.store, w);
     let owned = w.scan_chain(&node.store, ks).unwrap_or_default();
     let stealth: u64 = owned.iter().map(|o| o.value.0).sum();
     ok(json!({
-        "legacy": legacy,
-        "legacy_formatted": format_amount(legacy),
         "stealth": stealth,
         "stealth_formatted": format_amount(stealth),
-        "total": legacy + stealth,
-        "total_formatted": format_amount(legacy + stealth),
     }), id)
-}
-
-fn handle_getnewaddress(node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
-    let idx = w.next_unused_index(&node.store, 20);
-    ok(json!(w.address_at(idx, RPC_VERSION)), id)
 }
 
 fn handle_getstealthaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
@@ -237,7 +203,7 @@ fn handle_gettransaction(node: &Node<FileStore>, params: &[Value], id: Value) ->
     err(-5, "transaction not found", id)
 }
 
-fn handle_listunspent(node: &Node<FileStore>, w: &Wallet, params: &[Value], id: Value) -> String {
+fn handle_listunspent(node: &Node<FileStore>, _w: &Wallet, params: &[Value], id: Value) -> String {
     let min_amt = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
     let mut utxos: Vec<Value> = Vec::new();
     let store: &FileStore = &node.store;
@@ -245,52 +211,15 @@ fn handle_listunspent(node: &Node<FileStore>, w: &Wallet, params: &[Value], id: 
         if out.value.0 < min_amt {
             continue;
         }
-        let address = w.address_at(0, RPC_VERSION);
         utxos.push(json!({
             "txid": op.txid.to_hex(),
             "vout": op.index,
-            "address": address,
             "amount": out.value.0,
             "amount_formatted": format_amount(out.value.0),
             "script_pubkey_hex": hex::encode(&out.script_pubkey),
         }));
     }
     ok(json!(utxos), id)
-}
-
-fn handle_sendtoaddress(
-    node: &Node<FileStore>,
-    w: &Wallet,
-    ks: &FileKeyStore,
-    params: &[Value],
-    id: Value,
-) -> String {
-    let to_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
-    let to = match commit_from_address(to_str) {
-        Ok(c) => c,
-        Err(e) => return err(-5, &e, id),
-    };
-    let value = match params
-        .get(1)
-        .and_then(|v| v.as_str())
-        .map(|s| parse_amount(s))
-    {
-        Some(Ok(v)) => Amount(v),
-        Some(Err(e)) => return err(-5, &e, id),
-        None => return err(-32602, "invalid amount", id),
-    };
-    let from: u32 = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    match w.spend_from(&node.store, ks, from, to, value) {
-        Ok(tx) => {
-            write_tx(&tx);
-            let hex_str: String = to_bytes(&tx).iter().map(|b| format!("{b:02x}")).collect();
-            ok(json!({
-                "txid": tx.txid().to_hex(),
-                "hex": hex_str,
-            }), id)
-        }
-        Err(e) => err(-5, &format!("send failed: {e}"), id),
-    }
 }
 
 fn handle_sendtostealthaddress(
@@ -514,10 +443,6 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_getbalance(&n, wallet, ks, &req.params, id)
         }
-        "getnewaddress" => {
-            let n = node.lock().unwrap();
-            handle_getnewaddress(&n, wallet, &req.params, id)
-        }
         "getstealthaddress" => {
             let n = node.lock().unwrap();
             handle_getstealthaddress(&n, wallet, &req.params, id)
@@ -529,10 +454,6 @@ fn handle_request(
         "listunspent" => {
             let n = node.lock().unwrap();
             handle_listunspent(&n, wallet, &req.params, id)
-        }
-        "sendtoaddress" => {
-            let n = node.lock().unwrap();
-            handle_sendtoaddress(&n, wallet, ks, &req.params, id)
         }
         "sendtostealthaddress" => {
             let n = node.lock().unwrap();

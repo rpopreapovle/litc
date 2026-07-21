@@ -16,7 +16,7 @@ pub use litc_miner::{BlockTemplate, CpuMiner, MinerBackend};
 mod gpu {
     use super::{BlockTemplate, MinerBackend};
     use litc_pow::{meets_target, prepare_epoch, LANES, WALK};
-    use litc_primitives::{sha256d, to_bytes, Amount, Block, BlockHeader, Hash32, Transaction, TxOut};
+    use litc_primitives::{sha256d, to_bytes, Block, BlockHeader, Hash32, Transaction, TxOut};
     use std::sync::mpsc;
 
     const SHADER: &str = r#"
@@ -288,11 +288,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 version: 1,
                 inputs: vec![],
                 outputs: vec![TxOut {
-                    value: Amount(5 * 100_000_000),
-                    script_pubkey: t.coinbase_commit.to_vec(),
+                    value: t.coinbase_value,
+                    script_pubkey: t.coinbase_script.clone(),
                     ephemeral: vec![],
                 }],
-                ephemeral: vec![],
+                ephemeral: t.coinbase_ephemeral.clone(),
                 lock_time: 0,
             };
             let mut txs = vec![coinbase];

@@ -41,11 +41,9 @@ curl -s http://127.0.0.1:18334/ \
 
 | Method | Params | Returns |
 |---|---|---|
-| `getnewaddress` | `[]` | A new unused legacy address |
 | `getstealthaddress` | `[]` | The wallet's reusable stealth address |
-| `getbalance` | `[]` | Legacy + stealth balances (satoshis and formatted) |
+| `getbalance` | `[]` | Stealth balance (satoshis and formatted) |
 | `listunspent` | `[min_amount?]` | Array of UTXOs with txid, vout, amount |
-| `sendtoaddress` | `[to, amount, from_index?]` | Build, sign, and submit tx to legacy address |
 | `sendtostealthaddress` | `[to, amount, from_index?]` | Build, sign, and submit tx to stealth address |
 | `gettransaction` | `[txid]` | Transaction info (mempool + chain) |
 

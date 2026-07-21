@@ -58,25 +58,23 @@ The node persists chain under `$LITC_DATADIR` and drains `mempool/*.tx`
 ## `litc wallet`
 
 ```bash
-litc wallet new              # create wallet; print legacy + stealth address
-litc wallet address [i]      # print legacy address at index i (0)
-litc wallet stealth          # print the reusable stealth address
-litc wallet balance          # confirmed balance (legacy + stealth)
-litc wallet scan             # list owned stealth outputs
-litc wallet send <to> <amount> [--from i]           # pay a legacy address
+litc wallet new                # create wallet; print the reusable stealth address
+litc wallet stealth            # print the reusable stealth address
+litc wallet balance            # confirmed stealth balance
+litc wallet scan               # scan for owned stealth outputs
 litc wallet send-stealth <to> <amount> [--from i]   # pay a stealth address
 ```
 
 `<amount>` is whole satoshis or `<n>.<frac>LIT` (e.g. `10.5` = 10.5 LIT).
-`send`/`send-stealth` write a signed tx to `mempool/<txid>.tx` and print
+`send-stealth` writes a signed tx to `mempool/<txid>.tx` and prints
 the hex; a running `litc node` picks it up.
 
 ## Example session
 
 ```bash
 export LITC_DATADIR=/tmp/litc-demo
-litc wallet new                 # addresses derived from fresh seed
-litc node --port 8333 &         # starts mining to this wallet's address
+litc wallet new                 # fresh seed, stealth address printed
+litc node --port 8333 &         # starts mining to this wallet's stealth address
 sleep 9
 litc wallet balance             # shows mined coinbase (50 LIT/block)
 litc wallet send-stealth "$(litc wallet stealth)" 10.0   # pay self

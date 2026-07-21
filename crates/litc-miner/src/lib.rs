@@ -14,9 +14,12 @@ pub struct BlockTemplate {
     pub timestamp: u64,
     /// Epoch seed for the 512 MB scratchpad (see `docs/pow.md`).
     pub epoch_seed: Hash32,
-    /// 20-byte `HASH160(R)` of the miner's receiving address (coinbase output).
-    pub coinbase_commit: [u8; 20],
+    /// Coinbase value (block subsidy + fees).
     pub coinbase_value: Amount,
+    /// ScriptPubKey for the coinbase output (payment to miner's stealth address).
+    pub coinbase_script: Vec<u8>,
+    /// KEM ciphertext for the coinbase stealth output (tx-level ephemeral).
+    pub coinbase_ephemeral: Vec<u8>,
     /// Non-coinbase transactions to include.
     pub txs: Vec<Transaction>,
     /// Root committing to the live consensus state after this block is applied
@@ -42,10 +45,10 @@ impl MinerBackend for CpuMiner {
             inputs: vec![],
             outputs: vec![TxOut {
                 value: t.coinbase_value,
-                script_pubkey: t.coinbase_commit.to_vec(),
+                script_pubkey: t.coinbase_script.clone(),
                 ephemeral: vec![],
             }],
-            ephemeral: vec![],
+            ephemeral: t.coinbase_ephemeral.clone(),
             lock_time: 0,
         };
         let mut txs = vec![coinbase];
@@ -96,10 +99,10 @@ pub fn assemble_block(t: &BlockTemplate) -> Block {
         inputs: vec![],
         outputs: vec![TxOut {
             value: t.coinbase_value,
-            script_pubkey: t.coinbase_commit.to_vec(),
+            script_pubkey: t.coinbase_script.clone(),
             ephemeral: vec![],
         }],
-        ephemeral: vec![],
+        ephemeral: t.coinbase_ephemeral.clone(),
         lock_time: 0,
     };
     let mut txs = vec![coinbase];
@@ -132,8 +135,9 @@ mod tests {
             height: 1,
             timestamp: 1_700_000_000,
             epoch_seed: Hash32([2u8; 32]),
-            coinbase_commit: [0xaa; 20],
             coinbase_value: Amount(5 * 100_000_000),
+            coinbase_script: vec![0xaa; 20],
+            coinbase_ephemeral: vec![],
             txs: vec![],
             state_root: Hash32([0u8; 32]),
         };
