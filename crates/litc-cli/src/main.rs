@@ -2,18 +2,14 @@
 //!
 //! Subcommands:
 //!   litc node [...]                 — run the P2P/node daemon
-//!   litc wallet new                 — create wallet, print mnemonic + stealth address
+//!   litc wallet new                 — create wallet, print mnemonic + address
 //!   litc wallet restore <phrase>    — restore wallet from BIP39 mnemonic phrase
-//!   litc wallet stealth             — print the reusable stealth address
-//!   litc wallet balance             — show confirmed balance (stealth)
-//!   litc wallet scan                — list owned stealth outputs
-//!   litc wallet send-stealth <to> <amt> [--from i] — pay a stealth address
+//!   litc wallet balance             — show confirmed balance
 //!
 //! State lives under `$LITC_DATADIR` (default `./data`): `wallet.dat` (32-byte
-//! seed derived from BIP39 mnemonic), `wallet.dat.stealth` (recovered spend
-//! keys), and the chain files (`chain.dat`, `chain.idx`, `utxo.dat`,
-//! `burnt.dat`, `tip.dat`).
-//! `wallet send-stealth` writes the signed transaction to `data/mempool/<txid>.tx`;
+//! seed derived from BIP39 mnemonic), and the chain files (`chain.dat`,
+//! `chain.idx`, `utxo.dat`, `tip.dat`).
+//! `litc wallet send` writes the signed transaction to `data/mempool/<txid>.tx`;
 //! a running `litc node` picks it up and mines it.
 
 use std::env;
@@ -24,8 +20,8 @@ use std::thread;
 use bip39::{Language, Mnemonic};
 use litc_keystore::{FileKeyStore, KeyStore};
 use litc_pow::{meets_target, mine, prepare_epoch};
-use litc_primitives::{sha256d, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN};
-use litc_store::FileStore;
+use litc_primitives::{mldsa, sha256d, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN};
+use litc_store::{FileStore, UtxoStore};
 use litc_wallet::Wallet;
 
 use serde_json::json;
@@ -90,7 +86,7 @@ fn write_tx(tx: &Transaction) {
 
 fn cmd_wallet(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: litc wallet <new|restore|stealth|balance|scan|send-stealth>");
+        eprintln!("usage: litc wallet <new|restore|balance|send>");
         return;
     }
     match args[0].as_str() {
@@ -111,8 +107,8 @@ fn cmd_wallet(args: &[String]) {
             println!("mnemonic seed phrase (24 words — write this down!):");
             println!("{}", mnemonic);
             println!();
-            println!("stealth address: {}",
-                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET));
+            println!("address: {}",
+                w.address_at(0, mldsa::MAINNET_VERSION));
         }
         "restore" => {
             if args.len() < 2 {
@@ -132,50 +128,49 @@ fn cmd_wallet(args: &[String]) {
             ks.save_seed(&seed).expect("cannot save keystore");
             let w = Wallet::new(seed);
             println!("restored from mnemonic");
-            println!("stealth address: {}",
-                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET));
-        }
-        "stealth" => {
-            let (w, _ks) = open_wallet();
-            println!(
-                "{}",
-                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET)
-            );
+            println!("address: {}",
+                w.address_at(0, mldsa::MAINNET_VERSION));
         }
         "balance" => {
             let (w, _ks) = open_wallet();
             let store = open_store();
-            let owned = w.scan_chain(&store, &_ks).unwrap_or_default();
-            let stealth: u64 = owned.iter().map(|o| o.value.0).sum();
+            let mut sum: u64 = 0;
+            let mut idx = 0u32;
+            loop {
+                let commit = w.commitment_at(idx);
+                if let Some(op) = store.find_by_commit(&commit) {
+                    if let Some(out) = store.utxo(&op) {
+                        sum += out.value.0;
+                    }
+                    idx += 1;
+                } else {
+                    // gap limit: check next 20 addresses
+                    let mut found_more = false;
+                    for gap in 1..=20u32 {
+                        if let Some(op2) = store.find_by_commit(&w.commitment_at(idx + gap)) {
+                            if let Some(out2) = store.utxo(&op2) {
+                                sum += out2.value.0;
+                            }
+                            found_more = true;
+                        }
+                    }
+                    if found_more {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
             println!(
-                "stealth {:>16} sat ({}.{:08} LIT)",
-                stealth,
-                stealth / COIN,
-                stealth % COIN
+                "{:>16} sat ({}.{:08} LIT)",
+                sum,
+                sum / COIN,
+                sum % COIN
             );
         }
-        "scan" => {
-            let (w, ks) = open_wallet();
-            let store = open_store();
-            let owned = w.scan_chain(&store, &ks).unwrap_or_default();
-            if owned.is_empty() {
-                println!("no stealth outputs found");
-            }
-            for o in &owned {
-                println!(
-                    "{} value={} ({}.{:08} LIT)",
-                    o.outpoint.txid.to_hex(),
-                    o.value.0,
-                    o.value.0 / COIN,
-                    o.value.0 % COIN
-                );
-            }
-        }
-        "send-stealth" => {
+        "send" => {
             if args.len() < 3 {
-                eprintln!(
-                    "usage: litc wallet send-stealth <to-stealth-addr> <amount> [--from idx]"
-                );
+                eprintln!("usage: litc wallet send <to-address> <amount> [--from idx]");
                 return;
             }
             let to = args[1].clone();
@@ -187,9 +182,17 @@ fn cmd_wallet(args: &[String]) {
                 }
             };
             let from = parse_from(&args[3..]);
-            let (w, ks) = open_wallet();
+            let (w, _ks) = open_wallet();
             let store = open_store();
-            match w.send_stealth(&store, &ks, from, &to, value) {
+            // Parse bech32m recipient address → 20-byte commitment.
+            let (_v, to_commit) = match mldsa::parse_address(&to) {
+                Some(c) => c,
+                None => {
+                    eprintln!("invalid ML-DSA-2 address: {to}");
+                    return;
+                }
+            };
+            match w.spend_from(&store, from, to_commit, value) {
                 Ok(tx) => write_tx(&tx),
                 Err(e) => eprintln!("send failed: {e}"),
             }

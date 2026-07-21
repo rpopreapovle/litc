@@ -1,9 +1,7 @@
 use litc_core::sighash;
-use litc_keystore::{KeyStore, StealthKey};
-use litc_primitives::{
-    kem, stealth, wots, Amount, Hash32, OutPoint, SignatureScheme, Transaction, TxIn, TxOut,
-};
-use litc_wallet::{OwnedStealth, Wallet};
+use litc_keystore::KeyStore;
+use litc_primitives::{mldsa, Amount, Hash32, OutPoint, SignatureScheme, Transaction, TxIn, TxOut};
+use litc_wallet::Wallet;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,7 +11,6 @@ pub struct UtxoInfo {
     pub value: u64,
     pub commit: String,
     pub height: u64,
-    pub ephemeral: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,14 +64,6 @@ impl LightWallet {
 
     pub fn commitment_at(&self, index: u32) -> [u8; 20] {
         self.wallet.commitment_at(index)
-    }
-
-    pub fn stealth_address(&self, version: u8) -> String {
-        self.wallet.stealth_address(version)
-    }
-
-    pub fn kem_keypair(&self) -> ([u8; kem::KEM_PK_LEN], [u8; kem::KEM_SK_LEN]) {
-        self.wallet.kem_keypair()
     }
 
     fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
@@ -140,37 +129,15 @@ impl LightWallet {
             .ok_or_else(|| Error::Json("expected u64".into()))
     }
 
-    fn ensure_one_time(ks: &dyn KeyStore, commit: &[u8; 20]) -> Result<(), Error> {
-        let used = ks.load_used().map_err(|e| Error::Wallet(e.to_string()))?;
-        if used.iter().any(|c| c == commit) {
-            return Err(Error::Wallet(
-                "WOTS+ key already used — one-time signatures must never be reused".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn mark_one_time(ks: &dyn KeyStore, commit: &[u8; 20]) -> Result<(), Error> {
-        let mut used = ks.load_used().map_err(|e| Error::Wallet(e.to_string()))?;
-        if !used.iter().any(|c| c == commit) {
-            used.push(*commit);
-            ks.save_used(&used)
-                .map_err(|e| Error::Wallet(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     pub fn build_send(
         &self,
         utxo: &UtxoInfo,
         from_index: u32,
         to_commit: [u8; 20],
         value: Amount,
-        ks: &dyn KeyStore,
+        _ks: &dyn KeyStore,
     ) -> Result<Transaction, Error> {
         let kp = self.wallet.keypair_at(from_index);
-        let commit = kp.pubkey_root_hash160();
-        Self::ensure_one_time(ks, &commit)?;
         let total = utxo.value;
         if value.0 > total {
             return Err(Error::InsufficientFunds {
@@ -191,179 +158,29 @@ impl LightWallet {
             inputs: vec![TxIn {
                 prevout: outpoint,
                 script_sig: vec![],
-                scheme: SignatureScheme::Wots256,
+                scheme: SignatureScheme::Mldsa2,
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![
                 TxOut {
                     value,
                     script_pubkey: to_commit.to_vec(),
-                    ephemeral: vec![],
                 },
                 TxOut {
                     value: Amount(change),
                     script_pubkey: change_commit.to_vec(),
-                    ephemeral: vec![],
                 },
             ],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let msg = sighash(&tx, 0, &prev_script);
-        tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
-        Self::mark_one_time(ks, &commit)?;
+        let pk = kp.public_key_bytes();
+        let sig = kp.sign(&msg);
+        let mut script_sig = Vec::with_capacity(mldsa::PK_LEN + mldsa::SIG_LEN);
+        script_sig.extend_from_slice(&pk);
+        script_sig.extend_from_slice(&sig);
+        tx.inputs[0].script_sig = script_sig;
         Ok(tx)
-    }
-
-    pub fn build_send_stealth(
-        &self,
-        utxo: &UtxoInfo,
-        from_index: u32,
-        recipient: &str,
-        value: Amount,
-        ks: &dyn KeyStore,
-    ) -> Result<Transaction, Error> {
-        let (_, kem_pk) = stealth::parse_stealth_address(recipient)
-            .ok_or_else(|| Error::InvalidAddress("not a stealth address".into()))?;
-        let kp = self.wallet.keypair_at(from_index);
-        let commit = kp.pubkey_root_hash160();
-        Self::ensure_one_time(ks, &commit)?;
-        let total = utxo.value;
-        if value.0 > total {
-            return Err(Error::InsufficientFunds {
-                have: total,
-                need: value.0,
-            });
-        }
-        let change = total - value.0;
-        let change_commit = self.wallet.commitment_at(from_index + 1);
-        let outpoint = OutPoint {
-            txid: hex_to_hash32(&utxo.txid)?,
-            index: utxo.vout,
-        };
-        let prev_script = hex_to_vec(&utxo.commit)?;
-
-        let (ss, ct) = kem::kem_encaps(&kem_pk);
-        let stealth_out = TxOut {
-            value,
-            script_pubkey: stealth::stealth_script(&ss, 0).to_vec(),
-            ephemeral: vec![],
-        };
-        let mut outputs = vec![stealth_out];
-        if change > 0 {
-            outputs.push(TxOut {
-                value: Amount(change),
-                script_pubkey: change_commit.to_vec(),
-                ephemeral: vec![],
-            });
-        }
-        let mut tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                prevout: outpoint,
-                script_sig: vec![],
-                scheme: SignatureScheme::Wots256,
-                sequence: 0xFFFF_FFFF,
-            }],
-            outputs,
-            ephemeral: ct.to_vec(),
-            lock_time: 0,
-        };
-        let msg = sighash(&tx, 0, &prev_script);
-        tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
-        Self::mark_one_time(ks, &commit)?;
-        Ok(tx)
-    }
-
-    pub fn build_spend_stealth(
-        &self,
-        utxo: &UtxoInfo,
-        ks: &dyn KeyStore,
-        to_commit: [u8; 20],
-    ) -> Result<Transaction, Error> {
-        let commit_bytes = hex_to_vec(&utxo.commit)?;
-        let commit: [u8; 20] = commit_bytes
-            .try_into()
-            .map_err(|_| Error::InvalidAddress("bad commit hex".into()))?;
-        Self::ensure_one_time(ks, &commit)?;
-        let entry = ks
-            .load_stealth()
-            .map_err(|e| Error::Wallet(e.to_string()))?
-            .into_iter()
-            .find(|k| k.commit == commit)
-            .ok_or_else(|| Error::Wallet("no stealth key for this output".into()))?;
-        let kp = wots::WotsKeypair::new(entry.sk_seed, entry.pk_seed, entry.r);
-        let outpoint = OutPoint {
-            txid: hex_to_hash32(&utxo.txid)?,
-            index: utxo.vout,
-        };
-        let prev_script = hex_to_vec(&utxo.commit)?;
-
-        let mut tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                prevout: outpoint,
-                script_sig: vec![],
-                scheme: SignatureScheme::Wots256,
-                sequence: 0xFFFF_FFFF,
-            }],
-            outputs: vec![TxOut {
-                value: Amount(utxo.value),
-                script_pubkey: to_commit.to_vec(),
-                ephemeral: vec![],
-            }],
-            ephemeral: vec![],
-            lock_time: 0,
-        };
-        let msg = sighash(&tx, 0, &prev_script);
-        tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
-        Self::mark_one_time(ks, &commit)?;
-        Ok(tx)
-    }
-
-    pub fn scan_stealth(
-        &self,
-        utxos: &[UtxoInfo],
-        ks: &dyn KeyStore,
-    ) -> Result<Vec<OwnedStealth>, Error> {
-        let (_, sk) = self.wallet.kem_keypair();
-        let mut known = ks.load_stealth().unwrap_or_default();
-        let mut found = Vec::new();
-        for utxo in utxos {
-            let ephemeral = hex::decode(&utxo.ephemeral).map_err(|e| Error::Json(e.to_string()))?;
-            if ephemeral.is_empty() {
-                continue;
-            }
-            let kp = match stealth::recover_stealth_keypair_at(&sk, &ephemeral, utxo.vout) {
-                Some(kp) => kp,
-                None => continue,
-            };
-            let commit = kp.pubkey_root_hash160();
-            let commit_hex = hex::encode(commit);
-            if commit_hex != utxo.commit {
-                continue;
-            }
-            let outpoint = OutPoint {
-                txid: hex_to_hash32(&utxo.txid)?,
-                index: utxo.vout,
-            };
-            if !known.iter().any(|k| k.commit == commit) {
-                known.push(StealthKey {
-                    commit,
-                    sk_seed: kp.sk_seed,
-                    pk_seed: kp.pk_seed,
-                    r: kp.r,
-                });
-            }
-            found.push(OwnedStealth {
-                outpoint,
-                keypair: kp,
-                value: Amount(utxo.value),
-            });
-        }
-        ks.save_stealth(&known)
-            .map_err(|e| Error::Wallet(e.to_string()))?;
-        Ok(found)
     }
 
     pub fn broadcast(&self, tx_hex: &str) -> Result<String, Error> {
@@ -386,4 +203,114 @@ fn hex_to_hash32(s: &str) -> Result<Hash32, Error> {
 
 fn hex_to_vec(s: &str) -> Result<Vec<u8>, Error> {
     hex::decode(s).map_err(|e| Error::Json(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_send_basic() {
+        let seed = [0xABu8; 32];
+        let lw = LightWallet::new(seed, "http://localhost:8080");
+        let kp = lw.wallet.keypair_at(0);
+        let commit = kp.pubkey_hash160();
+
+        let utxo = UtxoInfo {
+            txid: "0000000000000000000000000000000000000000000000000000000000000001".into(),
+            vout: 0,
+            value: 500_000_000,
+            commit: hex::encode(commit),
+            height: 1,
+        };
+
+        let to_commit = [0xCDu8; 20];
+        let ks = litc_keystore::FileKeyStore::new("/tmp/lw_test_keystore");
+        let tx = lw
+            .build_send(&utxo, 0, to_commit, Amount(100_000_000), &ks)
+            .unwrap();
+
+        assert_eq!(tx.version, 1);
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, Amount(100_000_000));
+        assert_eq!(tx.outputs[0].script_pubkey, to_commit.to_vec());
+        assert_eq!(tx.outputs[1].value, Amount(400_000_000));
+        assert_eq!(tx.outputs[1].script_pubkey, lw.wallet.commitment_at(1).to_vec());
+        assert_eq!(tx.inputs[0].scheme, SignatureScheme::Mldsa2);
+        // script_sig = pk (1312) + sig (2420) = 3732 bytes
+        assert_eq!(tx.inputs[0].script_sig.len(), mldsa::PK_LEN + mldsa::SIG_LEN);
+    }
+
+    #[test]
+    fn build_send_insufficient_funds() {
+        let seed = [0xABu8; 32];
+        let lw = LightWallet::new(seed, "http://localhost:8080");
+        let kp = lw.wallet.keypair_at(0);
+        let commit = kp.pubkey_hash160();
+
+        let utxo = UtxoInfo {
+            txid: "0000000000000000000000000000000000000000000000000000000000000001".into(),
+            vout: 0,
+            value: 100,
+            commit: hex::encode(commit),
+            height: 1,
+        };
+
+        let to_commit = [0xCDu8; 20];
+        let ks = litc_keystore::FileKeyStore::new("/tmp/lw_test_keystore2");
+        let err = lw
+            .build_send(&utxo, 0, to_commit, Amount(200), &ks)
+            .unwrap_err();
+        match err {
+            Error::InsufficientFunds { have, need } => {
+                assert_eq!(have, 100);
+                assert_eq!(need, 200);
+            }
+            other => panic!("expected InsufficientFunds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utxo_info_no_ephemeral() {
+        let info = UtxoInfo {
+            txid: "0000000000000000000000000000000000000000000000000000000000000001".into(),
+            vout: 0,
+            value: 500_000_000,
+            commit: "abcdef".into(),
+            height: 1,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: UtxoInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.value, 500_000_000);
+        // No ephemeral field present in JSON
+        assert!(!json.contains("ephemeral"));
+    }
+
+    #[test]
+    fn build_send_all_to_one_output() {
+        let seed = [0x11u8; 32];
+        let lw = LightWallet::new(seed, "http://localhost:8080");
+        let kp = lw.wallet.keypair_at(0);
+        let commit = kp.pubkey_hash160();
+
+        let utxo = UtxoInfo {
+            txid: "0000000000000000000000000000000000000000000000000000000000000002".into(),
+            vout: 0,
+            value: 100_000_000,
+            commit: hex::encode(commit),
+            height: 5,
+        };
+
+        let to_commit = [0x99u8; 20];
+        let ks = litc_keystore::FileKeyStore::new("/tmp/lw_test_keystore3");
+        // Send the entire UTXO value (change = 0, second output still created)
+        let tx = lw
+            .build_send(&utxo, 0, to_commit, Amount(100_000_000), &ks)
+            .unwrap();
+
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, Amount(100_000_000));
+        assert_eq!(tx.outputs[1].value, Amount(0));
+    }
 }

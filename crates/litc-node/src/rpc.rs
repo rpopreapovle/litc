@@ -21,8 +21,6 @@ use litc_wallet::Wallet;
 
 use crate::{write_tx, Node, PeerMap};
 
-const RPC_VERSION: u8 = 1;
-
 #[derive(Deserialize)]
 struct RpcRequest {
     #[serde(rename = "jsonrpc")]
@@ -176,17 +174,42 @@ fn handle_getinfo(node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id
     }), id)
 }
 
-fn handle_getbalance(node: &Node<FileStore>, w: &Wallet, ks: &FileKeyStore, _params: &[Value], id: Value) -> String {
-    let owned = w.scan_chain(&node.store, ks).unwrap_or_default();
-    let stealth: u64 = owned.iter().map(|o| o.value.0).sum();
+fn handle_getbalance(node: &Node<FileStore>, w: &Wallet, _ks: &FileKeyStore, _params: &[Value], id: Value) -> String {
+    let mut sum: u64 = 0;
+    let mut idx = 0u32;
+    loop {
+        let commit = w.commitment_at(idx);
+        if let Some(op) = node.store.find_by_commit(&commit) {
+            if let Some(out) = node.store.utxo(&op) {
+                sum += out.value.0;
+            }
+            idx += 1;
+        } else {
+            let mut found_more = false;
+            for gap in 1..=20u32 {
+                if let Some(op2) = node.store.find_by_commit(&w.commitment_at(idx + gap)) {
+                    if let Some(out2) = node.store.utxo(&op2) {
+                        sum += out2.value.0;
+                    }
+                    found_more = true;
+                }
+            }
+            if found_more {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+    }
     ok(json!({
-        "stealth": stealth,
-        "stealth_formatted": format_amount(stealth),
+        "balance": sum,
+        "balance_formatted": format_amount(sum),
     }), id)
 }
 
-fn handle_getstealthaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
-    ok(json!(w.stealth_address(RPC_VERSION)), id)
+fn handle_getaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
+    use litc_primitives::mldsa;
+    ok(json!(w.address_at(0, mldsa::MAINNET_VERSION)), id)
 }
 
 fn handle_gettransaction(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
@@ -213,7 +236,7 @@ fn handle_listunspent(node: &Node<FileStore>, _w: &Wallet, params: &[Value], id:
     let min_amt = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
     let mut utxos: Vec<Value> = Vec::new();
     let store: &FileStore = &node.store;
-    for (op, out, _eph) in UtxoStore::iter_utxos(store) {
+    for (op, out) in UtxoStore::iter_utxos(store) {
         if out.value.0 < min_amt {
             continue;
         }
@@ -228,10 +251,10 @@ fn handle_listunspent(node: &Node<FileStore>, _w: &Wallet, params: &[Value], id:
     ok(json!(utxos), id)
 }
 
-fn handle_sendtostealthaddress(
+fn handle_send(
     node: &Node<FileStore>,
     w: &Wallet,
-    ks: &FileKeyStore,
+    _ks: &FileKeyStore,
     params: &[Value],
     id: Value,
 ) -> String {
@@ -246,7 +269,11 @@ fn handle_sendtostealthaddress(
         None => return err(-32602, "invalid amount", id),
     };
     let from: u32 = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    match w.send_stealth(&node.store, ks, from, &to, value) {
+    let (_v, to_commit) = match litc_primitives::mldsa::parse_address(&to) {
+        Some(c) => c,
+        None => return err(-5, "invalid ML-DSA-2 address", id),
+    };
+    match w.spend_from(&node.store, from, to_commit, value) {
         Ok(tx) => {
             write_tx(&tx);
             let hex_str: String = to_bytes(&tx).iter().map(|b| format!("{b:02x}")).collect();
@@ -367,7 +394,7 @@ fn handle_get_utxos(node: &Node<FileStore>, params: &[Value], id: Value) -> Stri
         Some(c)
     }).collect();
     let mut results = Vec::new();
-    for (op, out, ephemeral) in node.store.iter_utxos() {
+    for (op, out) in node.store.iter_utxos() {
         let Ok(commit) = <[u8; 20]>::try_from(out.script_pubkey.as_slice()) else {
             continue;
         };
@@ -381,7 +408,6 @@ fn handle_get_utxos(node: &Node<FileStore>, params: &[Value], id: Value) -> Stri
             "value": out.value.0,
             "commit": hex::encode(out.script_pubkey),
             "height": height,
-            "ephemeral": hex::encode(&ephemeral),
         }));
     }
     ok(json!(results), id)
@@ -504,9 +530,9 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_getbalance(&n, wallet, ks, &req.params, id)
         }
-        "getstealthaddress" => {
+        "getaddress" => {
             let n = node.lock().unwrap();
-            handle_getstealthaddress(&n, wallet, &req.params, id)
+            handle_getaddress(&n, wallet, &req.params, id)
         }
         "gettransaction" => {
             let n = node.lock().unwrap();
@@ -516,9 +542,9 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_listunspent(&n, wallet, &req.params, id)
         }
-        "sendtostealthaddress" => {
+        "send" => {
             let n = node.lock().unwrap();
-            handle_sendtostealthaddress(&n, wallet, ks, &req.params, id)
+            handle_send(&n, wallet, ks, &req.params, id)
         }
         "getmininginfo" => {
             let n = node.lock().unwrap();
