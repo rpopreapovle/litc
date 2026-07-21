@@ -86,7 +86,7 @@ fn write_tx(tx: &Transaction) {
 
 fn cmd_wallet(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: litc wallet <new|restore|balance|send>");
+        eprintln!("usage: litc wallet <new|restore|address|addresses|balance|history|send|export>");
         return;
     }
     match args[0].as_str() {
@@ -131,16 +131,30 @@ fn cmd_wallet(args: &[String]) {
             println!("address: {}",
                 w.address_at(0, mldsa::MAINNET_VERSION));
         }
+        "address" => {
+            let (w, _ks) = open_wallet();
+            let idx: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("{}", w.address_at(idx, mldsa::MAINNET_VERSION));
+        }
+        "addresses" => {
+            let (w, _ks) = open_wallet();
+            let count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            for i in 0..count as u32 {
+                println!("{}  index={i}", w.address_at(i, mldsa::MAINNET_VERSION));
+            }
+        }
         "balance" => {
             let (w, _ks) = open_wallet();
             let store = open_store();
             let mut sum: u64 = 0;
+            let mut count = 0u64;
             let mut idx = 0u32;
             loop {
                 let commit = w.commitment_at(idx);
                 if let Some(op) = store.find_by_commit(&commit) {
                     if let Some(out) = store.utxo(&op) {
                         sum += out.value.0;
+                        count += 1;
                     }
                     idx += 1;
                 } else {
@@ -150,6 +164,7 @@ fn cmd_wallet(args: &[String]) {
                         if let Some(op2) = store.find_by_commit(&w.commitment_at(idx + gap)) {
                             if let Some(out2) = store.utxo(&op2) {
                                 sum += out2.value.0;
+                                count += 1;
                             }
                             found_more = true;
                         }
@@ -161,12 +176,50 @@ fn cmd_wallet(args: &[String]) {
                     break;
                 }
             }
-            println!(
-                "{:>16} sat ({}.{:08} LIT)",
-                sum,
-                sum / COIN,
-                sum % COIN
-            );
+            println!("balance  {} sat ({}.{:08} LIT) in {count} UTXOs",
+                sum, sum / COIN, sum % COIN);
+        }
+        "history" => {
+            let (w, _ks) = open_wallet();
+            let store = open_store();
+            let mut idx = 0u32;
+            let mut found_any = false;
+            loop {
+                let commit = w.commitment_at(idx);
+                if let Some(op) = store.find_by_commit(&commit) {
+                    if let Some(out) = store.utxo(&op) {
+                        println!("  {}  index={idx}  {}.{:08} LIT",
+                            op.txid.to_hex(),
+                            out.value.0 / COIN,
+                            out.value.0 % COIN);
+                        found_any = true;
+                    }
+                    idx += 1;
+                } else {
+                    let mut found_more = false;
+                    for gap in 1..=20u32 {
+                        if let Some(op2) = store.find_by_commit(&w.commitment_at(idx + gap)) {
+                            if let Some(out2) = store.utxo(&op2) {
+                                println!("  {}  index={}  {}.{:08} LIT",
+                                    op2.txid.to_hex(),
+                                    idx + gap,
+                                    out2.value.0 / COIN,
+                                    out2.value.0 % COIN);
+                                found_any = true;
+                            }
+                            found_more = true;
+                        }
+                    }
+                    if found_more {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if !found_any {
+                println!("no transactions found");
+            }
         }
         "send" => {
             if args.len() < 3 {
@@ -196,6 +249,17 @@ fn cmd_wallet(args: &[String]) {
                 Ok(tx) => write_tx(&tx),
                 Err(e) => eprintln!("send failed: {e}"),
             }
+        }
+        "export" => {
+            let ks = FileKeyStore::new(datadir().join("wallet.dat"));
+            let seed = ks.load_seed().expect("cannot load keystore");
+            // Regenerate mnemonic from seed (not perfectly round-trippable via
+            // PBKDF2, so we just show the raw hex seed).
+            println!("seed (hex): {}", seed.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            println!();
+            let w = Wallet::new(seed);
+            println!("address: {}",
+                w.address_at(0, mldsa::MAINNET_VERSION));
         }
         other => eprintln!("unknown wallet subcommand: {other}"),
     }
