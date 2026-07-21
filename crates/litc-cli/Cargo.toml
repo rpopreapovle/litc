@@ -9,6 +9,7 @@ name = "litc"
 path = "src/main.rs"
 
 [dependencies]
+bip39 = "2"
 litc-node = { path = "../litc-node" }
 litc-wallet = { path = "../litc-wallet" }
 litc-keystore = { path = "../litc-keystore" }

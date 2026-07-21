@@ -258,6 +258,10 @@ impl Wallet {
     /// For every unspent output carrying a KEM ciphertext, decapsulate it and
     /// check whether the derived one-time WOTS+ key matches the output's
     /// commitment. Matches are persisted to the keystore and returned.
+    ///
+    /// **Optimisation**: outputs whose commitment is already in the keystore
+    /// are detected by script_pubkey lookup alone, avoiding an expensive KEM
+    /// decapsulation on every scan.
     pub fn scan_chain<S: UtxoStore>(
         &self,
         store: &S,
@@ -265,9 +269,35 @@ impl Wallet {
     ) -> Result<Vec<OwnedStealth>, String> {
         let (_, sk) = self.kem_keypair();
         let mut known = ks.load_stealth().unwrap_or_default();
+        // Build a fast lookup: script_pubkey → index in `known`.
+        let mut known_map: std::collections::HashMap<[u8; 20], usize> =
+            std::collections::HashMap::new();
+        for (i, k) in known.iter().enumerate() {
+            known_map.insert(k.commit, i);
+        }
+        let mut new_entries = Vec::new();
         let mut found = Vec::new();
         for (op, out, ephemeral) in <S as UtxoStore>::iter_utxos(store) {
             if ephemeral.is_empty() {
+                continue;
+            }
+            // Fast path: already known → reconstruct keypair from store.
+            if out.script_pubkey.len() == 20 {
+                let mut c = [0u8; 20];
+                c.copy_from_slice(&out.script_pubkey);
+                if let Some(&idx) = known_map.get(&c) {
+                    let k = &known[idx];
+                    let kp = wots::WotsKeypair::new(k.sk_seed, k.pk_seed, k.r);
+                    found.push(OwnedStealth {
+                        outpoint: op,
+                        keypair: kp,
+                        value: out.value,
+                    });
+                    continue;
+                }
+            }
+            // Slow path: attempt KEM decapsulation.
+            if out.script_pubkey.len() != 20 {
                 continue;
             }
             let kp = match stealth::recover_stealth_keypair_at(&sk, &ephemeral, op.index) {
@@ -278,15 +308,7 @@ impl Wallet {
                 continue;
             }
             let commit = kp.pubkey_root_hash160();
-            if known.iter().any(|k| k.commit == commit) {
-                found.push(OwnedStealth {
-                    outpoint: op,
-                    keypair: kp,
-                    value: out.value,
-                });
-                continue;
-            }
-            known.push(StealthKey {
+            new_entries.push(StealthKey {
                 commit,
                 sk_seed: kp.sk_seed,
                 pk_seed: kp.pk_seed,
@@ -298,7 +320,10 @@ impl Wallet {
                 value: out.value,
             });
         }
-        ks.save_stealth(&known)?;
+        if !new_entries.is_empty() {
+            known.extend(new_entries);
+            ks.save_stealth(&known)?;
+        }
         Ok(found)
     }
 

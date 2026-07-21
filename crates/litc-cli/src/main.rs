@@ -2,22 +2,25 @@
 //!
 //! Subcommands:
 //!   litc node [...]                 — run the P2P/node daemon
-//!   litc wallet new                 — create wallet, print stealth address
+//!   litc wallet new                 — create wallet, print mnemonic + stealth address
+//!   litc wallet restore <phrase>    — restore wallet from BIP39 mnemonic phrase
 //!   litc wallet stealth             — print the reusable stealth address
 //!   litc wallet balance             — show confirmed balance (stealth)
 //!   litc wallet scan                — list owned stealth outputs
 //!   litc wallet send-stealth <to> <amt> [--from i] — pay a stealth address
 //!
-//! State lives under `$LITC_DATADIR` (default `./data`): `wallet.dat` (seed),
-//! `wallet.dat.stealth` (recovered spend keys), and the chain files
-//! (`chain.dat`, `chain.idx`, `utxo.dat`, `burnt.dat`, `tip.dat`).
+//! State lives under `$LITC_DATADIR` (default `./data`): `wallet.dat` (32-byte
+//! seed derived from BIP39 mnemonic), `wallet.dat.stealth` (recovered spend
+//! keys), and the chain files (`chain.dat`, `chain.idx`, `utxo.dat`,
+//! `burnt.dat`, `tip.dat`).
 //! `wallet send-stealth` writes the signed transaction to `data/mempool/<txid>.tx`;
 //! a running `litc node` picks it up and mines it.
 
 use std::env;
 use std::path::PathBuf;
 
-use litc_keystore::FileKeyStore;
+use bip39::{Language, Mnemonic};
+use litc_keystore::{FileKeyStore, KeyStore};
 use litc_primitives::{to_bytes, Amount, Hash32, Transaction, COIN};
 use litc_store::FileStore;
 use litc_wallet::Wallet;
@@ -32,6 +35,16 @@ fn open_wallet() -> (Wallet, FileKeyStore) {
     let ks = FileKeyStore::new(datadir().join("wallet.dat"));
     let seed = ks.open_or_create().expect("cannot open keystore");
     (Wallet::new(seed), ks)
+}
+
+/// Derive a 32-byte wallet seed from a BIP39 mnemonic (PBKDF2 → first 32 bytes).
+fn seed_from_mnemonic(phrase: &str) -> Result<[u8; 32], String> {
+    let m = Mnemonic::parse_in_normalized(Language::English, phrase)
+        .map_err(|e| format!("invalid BIP39 phrase: {e}"))?;
+    let seed64 = m.to_seed("");
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed64[..32]);
+    Ok(seed)
 }
 
 fn open_store() -> FileStore {
@@ -72,16 +85,50 @@ fn write_tx(tx: &Transaction) {
 
 fn cmd_wallet(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: litc wallet <new|stealth|balance|scan|send-stealth>");
+        eprintln!("usage: litc wallet <new|restore|stealth|balance|scan|send-stealth>");
         return;
     }
     match args[0].as_str() {
         "new" => {
-            let (w, _ks) = open_wallet();
-            println!(
-                "stealth address: {}",
-                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET)
-            );
+            let ks = FileKeyStore::new(datadir().join("wallet.dat"));
+            if ks.exists() {
+                eprintln!("wallet already exists at {}", datadir().join("wallet.dat").display());
+                return;
+            }
+            // Generate 256-bit entropy → BIP39 24-word mnemonic → PBKDF2 seed.
+            let entropy = litc_keystore::random_seed().expect("cannot get entropy");
+            let mnemonic = Mnemonic::from_entropy(&entropy).expect("valid entropy");
+            let seed64 = mnemonic.to_seed("");
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&seed64[..32]);
+            ks.save_seed(&seed).expect("cannot save keystore");
+            let w = Wallet::new(seed);
+            println!("mnemonic seed phrase (24 words — write this down!):");
+            println!("{}", mnemonic);
+            println!();
+            println!("stealth address: {}",
+                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET));
+        }
+        "restore" => {
+            if args.len() < 2 {
+                eprintln!("usage: litc wallet restore \"<24-word BIP39 phrase>\"");
+                return;
+            }
+            let ks = FileKeyStore::new(datadir().join("wallet.dat"));
+            if ks.exists() {
+                eprintln!("wallet already exists; remove {} first",
+                    datadir().join("wallet.dat").display());
+                return;
+            }
+            let seed = match seed_from_mnemonic(&args[1]) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("{e}"); return; }
+            };
+            ks.save_seed(&seed).expect("cannot save keystore");
+            let w = Wallet::new(seed);
+            println!("restored from mnemonic");
+            println!("stealth address: {}",
+                w.stealth_address(litc_primitives::stealth::STEALTH_VERSION_MAINNET));
         }
         "stealth" => {
             let (w, _ks) = open_wallet();
