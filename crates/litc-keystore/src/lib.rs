@@ -8,22 +8,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// A one-time WOTS+ spend key recovered by scanning the chain for a stealth
-/// payment. Persisted by the wallet so owned outputs are remembered across
-/// restarts without rescanning.
-#[derive(Clone)]
-pub struct StealthKey {
-    pub commit: [u8; 20],
-    pub sk_seed: [u8; 32],
-    pub pk_seed: [u8; 32],
-    pub r: [u8; 32],
-}
-
-impl StealthKey {
-    /// Fixed on-disk record size: commit + sk_seed + pk_seed + r.
-    pub const RECORD_LEN: usize = 20 + 32 + 32 + 32;
-}
-
 /// A store for the wallet's master seed.
 pub trait KeyStore {
     /// Load the stored seed.
@@ -32,17 +16,6 @@ pub trait KeyStore {
     fn save_seed(&self, seed: &[u8; 32]) -> Result<(), String>;
     /// Whether a seed is already stored.
     fn exists(&self) -> bool;
-    /// Load the recovered one-time stealth spend keys.
-    fn load_stealth(&self) -> Result<Vec<StealthKey>, String>;
-    /// Persist the recovered one-time stealth spend keys (replaces all).
-    fn save_stealth(&self, keys: &[StealthKey]) -> Result<(), String>;
-    /// Load the 20-byte WOTS+ commitments this wallet has already signed a
-    /// spend for. WOTS+ keys are one-time: reusing one leaks the secret, so the
-    /// wallet must never sign the same commitment twice — even for an
-    /// unconfirmed transaction. See `docs/wots.md`.
-    fn load_used(&self) -> Result<Vec<[u8; 20]>, String>;
-    /// Persist the spent WOTS+ commitments (replaces all).
-    fn save_used(&self, used: &[[u8; 20]]) -> Result<(), String>;
 }
 
 /// Flat-file key store at `path`. The seed is stored as raw 32 bytes.
@@ -88,80 +61,6 @@ impl KeyStore for FileKeyStore {
 
     fn exists(&self) -> bool {
         self.path.exists()
-    }
-
-    fn load_stealth(&self) -> Result<Vec<StealthKey>, String> {
-        let path = self.path.with_extension("stealth");
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-        let bytes = fs::read(&path).map_err(|e| format!("cannot read stealth store: {e}"))?;
-        if bytes.len() % StealthKey::RECORD_LEN != 0 {
-            return Err("corrupt stealth store".into());
-        }
-        let mut out = Vec::with_capacity(bytes.len() / StealthKey::RECORD_LEN);
-        for chunk in bytes.chunks(StealthKey::RECORD_LEN) {
-            let mut commit = [0u8; 20];
-            commit.copy_from_slice(&chunk[..20]);
-            let mut sk_seed = [0u8; 32];
-            sk_seed.copy_from_slice(&chunk[20..52]);
-            let mut pk_seed = [0u8; 32];
-            pk_seed.copy_from_slice(&chunk[52..84]);
-            let mut r = [0u8; 32];
-            r.copy_from_slice(&chunk[84..116]);
-            out.push(StealthKey {
-                commit,
-                sk_seed,
-                pk_seed,
-                r,
-            });
-        }
-        Ok(out)
-    }
-
-    fn save_stealth(&self, keys: &[StealthKey]) -> Result<(), String> {
-        let path = self.path.with_extension("stealth");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create dir: {e}"))?;
-        }
-        let mut buf = Vec::with_capacity(keys.len() * StealthKey::RECORD_LEN);
-        for k in keys {
-            buf.extend_from_slice(&k.commit);
-            buf.extend_from_slice(&k.sk_seed);
-            buf.extend_from_slice(&k.pk_seed);
-            buf.extend_from_slice(&k.r);
-        }
-        fs::write(&path, buf).map_err(|e| format!("cannot write stealth store: {e}"))
-    }
-
-    fn load_used(&self) -> Result<Vec<[u8; 20]>, String> {
-        let path = self.path.with_extension("used");
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-        let bytes = fs::read(&path).map_err(|e| format!("cannot read used store: {e}"))?;
-        if bytes.len() % 20 != 0 {
-            return Err("corrupt used store".into());
-        }
-        let mut out = Vec::with_capacity(bytes.len() / 20);
-        for chunk in bytes.chunks(20) {
-            let mut commit = [0u8; 20];
-            commit.copy_from_slice(chunk);
-            out.push(commit);
-        }
-        Ok(out)
-    }
-
-    fn save_used(&self, used: &[[u8; 20]]) -> Result<(), String> {
-        let path = self.path.with_extension("used");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create dir: {e}"))?;
-        }
-        let mut buf = Vec::with_capacity(used.len() * 20);
-        for c in used {
-            buf.extend_from_slice(c);
-        }
-        fs::write(&path, buf).map_err(|e| format!("cannot write used store: {e}"))
     }
 }
 
