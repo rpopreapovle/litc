@@ -128,7 +128,7 @@ const MAX_MEMPOOL: usize = 50_000;
 const PEER_TX_WINDOW: u64 = 60;
 const PEER_TX_LIMIT: usize = 200;
 const PEER_BLOCK_WINDOW: u64 = 60;
-const PEER_BLOCK_LIMIT: usize = 20;
+const PEER_BLOCK_LIMIT: usize = 200;
 /// Sentinel "peer" for locally-originated traffic (miner output, the mempool
 /// directory), which is trusted and not rate-limited in the same way.
 const LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
@@ -1090,17 +1090,22 @@ pub fn run(args: Vec<String>) {
         let p = peers.clone();
         let nd = node.clone();
         let kn = known.clone();
-        // Resolve hostname → IP (supports both "1.2.3.4:8333" and "host.com:8333").
-        let addrs: Vec<SocketAddr> = match c.to_socket_addrs() {
-            Ok(mut a) => a.collect(),
-            Err(_) => {
-                eprintln!("cannot resolve {c}");
+        // Resolve hostname → IP (connects only the first address to avoid
+        // duplicate connections when a name resolves to both IPv4 and IPv6).
+        let addr = match c.to_socket_addrs() {
+            Ok(mut a) => match a.next() {
+                Some(a) => a,
+                None => {
+                    eprintln!("cannot resolve {c}: no addresses");
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("cannot resolve {c}: {e}");
                 continue;
             }
         };
-        for addr in addrs {
-            connect_to(addr, p.clone(), nd.clone(), kn.clone(), listen);
-        }
+        connect_to(addr, p, nd, kn, listen);
     }
 
     if mine {
