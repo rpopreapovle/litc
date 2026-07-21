@@ -504,6 +504,7 @@ const MAX_SYNC_INV: usize = 2000;
 struct Peer {
     writer: Arc<Mutex<TcpStream>>,
     handshaked: bool,
+    listening_addr: Option<SocketAddr>,
 }
 
 fn is_handshake(m: &Message) -> bool {
@@ -616,12 +617,27 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
     known: &AddrSet,
     listen: SocketAddr,
     connecting: &AddrSet,
-) {
+) -> bool {
     let codec = Codec::new(node.lock().unwrap().params.magic);
     match msg {
         Message::Version { from, .. } => {
-            // Record the peer's self-reported listening address for gossip.
             if let Some(sa) = netaddr_to_socket(&from) {
+                let mut map = peers.lock().unwrap();
+                // Check if we're already connected to this peer's listening address.
+                for (other_addr, other_peer) in map.iter() {
+                    if *other_addr != addr
+                        && other_peer.handshaked
+                        && other_peer.listening_addr == Some(sa)
+                    {
+                        eprintln!("[p2p] dropping duplicate connection from {sa} (already connected via {other_addr})");
+                        return false;
+                    }
+                }
+                // Store the listening address for future dedup checks.
+                if let Some(p) = map.get_mut(&addr) {
+                    p.listening_addr = Some(sa);
+                }
+                drop(map);
                 known.lock().unwrap().insert(sa);
             }
             send_msg(peers, &addr, &codec, &Message::Verack);
@@ -709,7 +725,11 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 eprintln!("[p2p] Addr handler: new_peer={sa}");
             }
             for sa in new_peers {
-                let already = peers.lock().unwrap().contains_key(&sa);
+                let already = {
+                    let map = peers.lock().unwrap();
+                    map.contains_key(&sa)
+                        || map.values().any(|p| p.listening_addr == Some(sa))
+                };
                 if !already {
                     eprintln!("[p2p] Addr handler -> connect_to {sa}");
                     connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
@@ -757,6 +777,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
         Message::Ping(n) => send_msg(peers, &addr, &codec, &Message::Pong(n)),
         Message::Pong(_) | Message::Request { .. } | Message::Response { .. } => {}
     }
+    true
 }
 
 /// Drive one peer connection: register the writer, perform the version
@@ -779,6 +800,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
         Peer {
             writer,
             handshaked: false,
+            listening_addr: None,
         },
     );
 
@@ -812,11 +834,15 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
             eprintln!("[p2p] peer {addr} exceeded buffer limit; dropping");
             break;
         }
+        let mut disconnected = false;
         loop {
             match codec.parse(&buf) {
                 Ok(Some((msg, consumed))) => {
                     buf.drain(..consumed);
-                    on_message(addr, msg, &node, &peers, &known, listen, connecting);
+                    if !on_message(addr, msg, &node, &peers, &known, listen, connecting) {
+                        disconnected = true;
+                        break;
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -824,6 +850,9 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
                     return;
                 }
             }
+        }
+        if disconnected {
+            break;
         }
     }
     peers.lock().unwrap().remove(&addr);
