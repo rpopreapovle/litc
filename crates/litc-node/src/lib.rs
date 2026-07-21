@@ -622,23 +622,30 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
     match msg {
         Message::Version { from, .. } => {
             if let Some(sa) = netaddr_to_socket(&from) {
+                // If the peer sent 0.0.0.0 as its listening address (bound
+                // to the wildcard), use the actual remote socket address
+                // instead — that's how we can reach it.
+                let effective = if sa.ip().is_unspecified() { addr } else { sa };
                 let mut map = peers.lock().unwrap();
                 // Check if we're already connected to this peer's listening address.
                 for (other_addr, other_peer) in map.iter() {
                     if *other_addr != addr
                         && other_peer.handshaked
-                        && other_peer.listening_addr == Some(sa)
+                        && other_peer.listening_addr == Some(effective)
                     {
-                        eprintln!("[p2p] dropping duplicate connection from {sa} (already connected via {other_addr})");
+                        eprintln!("[p2p] dropping duplicate connection from {effective} (already connected via {other_addr})");
                         return false;
                     }
                 }
                 // Store the listening address for future dedup checks.
                 if let Some(p) = map.get_mut(&addr) {
-                    p.listening_addr = Some(sa);
+                    p.listening_addr = Some(effective);
                 }
                 drop(map);
-                known.lock().unwrap().insert(sa);
+                // Only gossip routable addresses — skip 0.0.0.0.
+                if !sa.ip().is_unspecified() {
+                    known.lock().unwrap().insert(sa);
+                }
             }
             send_msg(peers, &addr, &codec, &Message::Verack);
         }
@@ -714,6 +721,10 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 let mut k = known.lock().unwrap();
                 for na in &list {
                     if let Some(sa) = netaddr_to_socket(na) {
+                        // Skip unspecified addresses — they're not routable.
+                        if sa.ip().is_unspecified() {
+                            continue;
+                        }
                         if k.insert(sa) {
                             new_peers.push(sa);
                         }
