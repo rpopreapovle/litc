@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 sha2 = "0.10"
 ripemd = "0.1"
-ml-kem = { version = "0.3", features = ["getrandom"] }
+ml-dsa = "0.1"

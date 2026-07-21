@@ -308,20 +308,18 @@ pub struct OutPoint {
     pub index: u32,
 }
 
-/// Signature scheme used to authorize a transaction input. Only `Wots256` is
-/// active today; the reserved values leave room for future post-quantum (or
-/// hybrid) schemes without a chain-wide flag day, and `Unknown` rejects
-/// anything unrecognized. The scheme is carried per-input so a single
-/// transaction may mix schemes once more than one is active.
+/// Signature scheme used to authorize a transaction input. `Mldsa2` (ML-DSA-2,
+/// NIST FIPS 204) is the active scheme; reserved values leave room for future
+/// post-quantum schemes without a chain-wide flag day.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SignatureScheme {
-    /// WOTS+ with Winternitz parameter w = 256 (the launch scheme).
-    Wots256 = 0,
-    /// Reserved for a future scheme (e.g. a different WOTS+ parameterization).
+    /// ML-DSA-2 (Dilithium, FIPS 204) — the launch scheme.
+    Mldsa2 = 0,
+    /// Reserved for a future scheme.
     Reserved1 = 1,
-    /// Reserved for a future scheme (e.g. a SPHINCS+-style few-time signature).
+    /// Reserved for a future scheme.
     Reserved2 = 2,
-    /// Reserved for a future scheme (e.g. a hybrid Falcon + WOTS+ construction).
+    /// Reserved for a future scheme.
     Reserved3 = 3,
     /// Any scheme id not recognized by this implementation.
     Unknown = 255,
@@ -330,7 +328,7 @@ pub enum SignatureScheme {
 impl SignatureScheme {
     pub fn from_u8(b: u8) -> Self {
         match b {
-            0 => SignatureScheme::Wots256,
+            0 => SignatureScheme::Mldsa2,
             1 => SignatureScheme::Reserved1,
             2 => SignatureScheme::Reserved2,
             3 => SignatureScheme::Reserved3,
@@ -340,10 +338,9 @@ impl SignatureScheme {
     pub fn to_u8(self) -> u8 {
         self as u8
     }
-    /// Whether this scheme is accepted by the validator. Reserved schemes are
-    /// not yet active; `Unknown` is never accepted.
+    /// Whether this scheme is accepted by the validator.
     pub fn is_active(self) -> bool {
-        self == SignatureScheme::Wots256
+        self == SignatureScheme::Mldsa2
     }
 }
 
@@ -370,10 +367,6 @@ pub struct TxIn {
 pub struct TxOut {
     pub value: Amount,
     pub script_pubkey: Vec<u8>,
-    /// Stealth-address ciphertext (ML-KEM) for outputs sent to a reusable
-    /// address. Empty for ordinary single-use outputs. Carried in the UTXO so
-    /// the recipient can scan and recover the one-time WOTS+ spend key.
-    pub ephemeral: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -381,14 +374,6 @@ pub struct Transaction {
     pub version: u32,
     pub inputs: Vec<TxIn>,
     pub outputs: Vec<TxOut>,
-    /// Transaction-level KEM ciphertext for aggregated stealth outputs (see
-    /// `docs/stealth.md`). When a transaction pays one or more reusable stealth
-    /// addresses, the sender encapsulates **once** and attaches the single
-    /// ciphertext here; each stealth output derives its one-time WOTS+ key as
-    /// `derive(stealth_seed(ss), output_index)`. This avoids repeating the
-    /// ~768-byte ciphertext per output. Empty for transactions with no stealth
-    /// outputs. The per-output `TxOut.ephemeral` is no longer used.
-    pub ephemeral: Vec<u8>,
     pub lock_time: u32,
 }
 
@@ -428,7 +413,6 @@ impl Encodable for TxOut {
     fn encode(&self, w: &mut Vec<u8>) {
         self.value.encode(w);
         self.script_pubkey.encode(w);
-        self.ephemeral.encode(w);
     }
 }
 impl Decodable for TxOut {
@@ -436,7 +420,6 @@ impl Decodable for TxOut {
         Ok(TxOut {
             value: Amount::decode(r)?,
             script_pubkey: Vec::<u8>::decode(r)?,
-            ephemeral: Vec::<u8>::decode(r)?,
         })
     }
 }
@@ -445,7 +428,6 @@ impl Encodable for Transaction {
         self.version.encode(w);
         self.inputs.encode(w);
         self.outputs.encode(w);
-        self.ephemeral.encode(w);
         self.lock_time.encode(w);
     }
 }
@@ -455,7 +437,6 @@ impl Decodable for Transaction {
             version: u32::decode(r)?,
             inputs: Vec::<TxIn>::decode(r)?,
             outputs: Vec::<TxOut>::decode(r)?,
-            ephemeral: Vec::<u8>::decode(r)?,
             lock_time: u32::decode(r)?,
         })
     }
@@ -477,10 +458,10 @@ pub struct BlockHeader {
     pub version: u32,
     pub prev_block: Hash32,
     pub merkle_root: Hash32,
-    /// Root committing to the full live consensus state (UTXO set + burnt
-    /// keys) after this block is applied. See `docs/state.md`. Lets a node
-    /// bootstrap from a snapshot without trusting developers, peers, or
-    /// hardcoded checkpoints — only the Proof-of-Work securing the header.
+    /// Root committing to the full live consensus state (UTXO set) after
+    /// this block is applied. See `docs/state.md`. Lets a node bootstrap
+    /// from a snapshot without trusting developers, peers, or hardcoded
+    /// checkpoints — only the Proof-of-Work securing the header.
     pub state_root: Hash32,
     pub timestamp: u64,
     pub height: u64,
@@ -672,10 +653,7 @@ pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
 
 // ---------------------------------------------------------------------------
 // Bech32m (BIP350) — lowercase, checksummed, copy-friendly encoding. Used for
-// the (large) reusable stealth address so it is at least case-insensitive and
-// self-verifying. NOTE: this is *cosmetic* — the 800-byte KEM key is still
-// encoded in full, so the string stays long; a truly short address needs a
-// protocol change (see docs/stealth.md).
+// ML-DSA-2 addresses: bech32m("litc", version || HASH160(pk)) → ~40 chars.
 // ---------------------------------------------------------------------------
 
 const BECH32_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -789,420 +767,10 @@ pub fn bech32m_decode(s: &str) -> Option<(String, Vec<u8>)> {
 }
 
 // ---------------------------------------------------------------------------
-// WOTS+ (post-quantum, one-time signatures)
+// ML-DSA-2 (post-quantum, reusable signatures)
 // ---------------------------------------------------------------------------
 
-/// Winternitz One-Time Signature Plus. Hash-based, quantum-resistant. Each
-/// key pair is used for exactly one signature; see `docs/wots.md`.
-pub mod wots {
-    use super::*;
-
-    pub const W: usize = 256;
-    pub const N: usize = 32;
-    pub const L1: usize = 32;
-    pub const L2: usize = 2;
-    pub const L: usize = L1 + L2; // 34 chains
-
-    pub const MAINNET_VERSION: u8 = 0x30;
-    pub const TESTNET_VERSION: u8 = 0x6F;
-
-    /// A WOTS+ key pair for one address. `sk_seed` is the secret; `pk_seed`
-    /// and `r` are public and required for signing/verification.
-    #[derive(Clone)]
-    pub struct WotsKeypair {
-        pub sk_seed: [u8; N],
-        pub pk_seed: [u8; N],
-        pub r: [u8; N],
-    }
-
-    /// A WOTS+ signature — the spending witness.
-    pub struct WotsSignature {
-        pub pk_seed: [u8; N],
-        pub r: [u8; N],
-        pub sig: [[u8; N]; L],
-    }
-
-    fn prf(key: &[u8; N], label: u8, index: u32, out: &mut [u8; N]) {
-        let mut h = Sha256::new();
-        h.update(key);
-        h.update(index.to_be_bytes());
-        h.update([label]);
-        let d = h.finalize();
-        out.copy_from_slice(&d);
-    }
-
-    impl WotsKeypair {
-        pub fn new(sk_seed: [u8; N], pk_seed: [u8; N], r: [u8; N]) -> Self {
-            WotsKeypair {
-                sk_seed,
-                pk_seed,
-                r,
-            }
-        }
-
-        /// Deterministic derivation from a master seed and an address index.
-        /// The stateless wallet derives one fresh key pair per index.
-        pub fn derive(master: &[u8; N], index: u32) -> Self {
-            let mut sk = [0u8; N];
-            prf(master, 1, index, &mut sk);
-            let mut pk = [0u8; N];
-            prf(master, 2, index, &mut pk);
-            let mut r = [0u8; N];
-            prf(master, 3, index, &mut r);
-            WotsKeypair::new(sk, pk, r)
-        }
-
-        fn sk_i(&self, i: usize) -> [u8; N] {
-            let mut h = Sha256::new();
-            h.update(self.sk_seed);
-            h.update((i as u16).to_be_bytes());
-            h.update([0u8]);
-            let d = h.finalize();
-            let mut out = [0u8; N];
-            out.copy_from_slice(&d);
-            out
-        }
-
-        /// Public root `R` (the committed key).
-        pub fn pubkey_root(&self) -> [u8; N] {
-            let mut root_input = Vec::with_capacity(2 * N + L * N);
-            root_input.extend_from_slice(&self.pk_seed);
-            root_input.extend_from_slice(&self.r);
-            for i in 0..L {
-                let sk = self.sk_i(i);
-                let pk = chain(&sk, 0, (W - 1) as u8, i as u16, &self.pk_seed, &self.r);
-                root_input.extend_from_slice(&pk);
-            }
-            let d = Sha256::digest(&root_input);
-            let mut out = [0u8; N];
-            out.copy_from_slice(&d);
-            out
-        }
-
-        pub fn pubkey_root_hash160(&self) -> [u8; 20] {
-            hash160(&self.pubkey_root())
-        }
-
-        /// Address = base58check(version || HASH160(R)).
-        pub fn address(&self, version: u8) -> String {
-            base58check_encode(version, &self.pubkey_root_hash160())
-        }
-
-        pub fn sign(&self, msg: &[u8; N]) -> WotsSignature {
-            let digits = msg_digits(msg);
-            let mut sig = [[0u8; N]; L];
-            for i in 0..L {
-                let sk = self.sk_i(i);
-                sig[i] = chain(&sk, 0, digits[i], i as u16, &self.pk_seed, &self.r);
-            }
-            WotsSignature {
-                pk_seed: self.pk_seed,
-                r: self.r,
-                sig,
-            }
-        }
-    }
-
-    impl WotsSignature {
-        /// Verify against a 256-bit message and the expected HASH160(R)
-        /// committed by the output's script.
-        pub fn verify(&self, msg: &[u8; N], root_hash: &[u8; 20]) -> bool {
-            let digits = msg_digits(msg);
-            let mut root_input = Vec::with_capacity(2 * N + L * N);
-            root_input.extend_from_slice(&self.pk_seed);
-            root_input.extend_from_slice(&self.r);
-            for (i, (sig_i, &d)) in self.sig.iter().zip(digits.iter()).enumerate() {
-                let pk = chain(sig_i, d, (W - 1) as u8, i as u16, &self.pk_seed, &self.r);
-                root_input.extend_from_slice(&pk);
-            }
-            let d = Sha256::digest(&root_input);
-            let mut root = [0u8; N];
-            root.copy_from_slice(&d);
-            hash160(&root) == *root_hash
-        }
-    }
-
-    impl Encodable for WotsSignature {
-        fn encode(&self, w: &mut Vec<u8>) {
-            w.extend_from_slice(&self.pk_seed);
-            w.extend_from_slice(&self.r);
-            for s in &self.sig {
-                w.extend_from_slice(s);
-            }
-        }
-    }
-
-    impl Decodable for WotsSignature {
-        fn decode(r: &mut Reader) -> Result<Self, String> {
-            let pk_seed: [u8; N] = r.read(N)?.try_into().map_err(|_| "bad witness")?;
-            let r2: [u8; N] = r.read(N)?.try_into().map_err(|_| "bad witness")?;
-            let mut sig = [[0u8; N]; L];
-            for s in sig.iter_mut() {
-                *s = r.read(N)?.try_into().map_err(|_| "bad witness")?;
-            }
-            Ok(WotsSignature {
-                pk_seed,
-                r: r2,
-                sig,
-            })
-        }
-    }
-
-    /// Encode a signature into the canonical witness bytes (for `script_sig`).
-    pub fn encode_witness(sig: &WotsSignature) -> Vec<u8> {
-        to_bytes(sig)
-    }
-
-    /// Decode canonical witness bytes back into a signature.
-    pub fn decode_witness(b: &[u8]) -> Result<WotsSignature, String> {
-        let mut r = Reader::new(b);
-        let s = WotsSignature::decode(&mut r)?;
-        if r.remaining() != 0 {
-            return Err("trailing bytes in witness".into());
-        }
-        Ok(s)
-    }
-
-    /// Split a 256-bit message into `L` base-`W` digits, including an `L2`-digit
-    /// checksum. The decomposition is generic over `W` (here `W = 256`, so each
-    /// message byte is exactly one digit; the checksum `Σ(W-1 - d_i)` fits in
-    /// `L2` base-`W` digits). Smaller `W` (e.g. 16) would take more chains but
-    /// fewer hash iterations per chain — a size/CPU tradeoff.
-    fn msg_digits(msg: &[u8; N]) -> [u8; L] {
-        let mut digits = [0u8; L];
-        if W >= 256 {
-            // One digit per message byte.
-            for (b, byte) in msg.iter().enumerate().take(L1) {
-                digits[b] = *byte;
-            }
-        } else {
-            // W = 16: two base-16 nibbles per message byte.
-            for (b, byte) in msg.iter().enumerate().take(32) {
-                digits[2 * b] = (byte >> 4) & 0x0F;
-                digits[2 * b + 1] = byte & 0x0F;
-            }
-        }
-        let mut c: u32 = 0;
-        for &d in &digits[..L1] {
-            c += (W as u32 - 1) - d as u32;
-        }
-        // Big-endian base-W encoding of the checksum into the last L2 digits.
-        for i in (0..L2).rev() {
-            digits[L1 + i] = (c % (W as u32)) as u8;
-            c /= W as u32;
-        }
-        digits
-    }
-
-    /// WOTS+ chain function: iterate the hash from `start` to `end` (exclusive).
-    /// The position (chain index `i`, step `j`) is baked into the hash input so
-    /// no two steps collide.
-    fn chain(x: &[u8; N], start: u8, end: u8, i: u16, pk_seed: &[u8; N], r: &[u8; N]) -> [u8; N] {
-        let mut buf = [0u8; N + N + 2 + 1 + N]; // pk_seed || r || i || j || x
-        buf[..N].copy_from_slice(pk_seed);
-        buf[N..2 * N].copy_from_slice(r);
-        buf[2 * N..2 * N + 2].copy_from_slice(&i.to_be_bytes());
-        let mut out = *x;
-        for j in start..end {
-            buf[2 * N + 2] = j;
-            buf[2 * N + 3..].copy_from_slice(&out);
-            let d = Sha256::digest(buf);
-            out.copy_from_slice(&d);
-        }
-        out
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ML-KEM-512 (post-quantum Key Encapsulation Mechanism)
-//
-// Used only to build *reusable* stealth addresses on top of the one-time
-// WOTS+ signatures. The KEM never signs anything — it just lets a sender
-// establish a shared secret with the recipient's long-term scan key, from
-// which a fresh one-time WOTS+ key is derived per payment. This hides the
-// one-time-use nature of WOTS+ behind the wallet, so the user-facing address
-// stays fixed and compact (800 bytes) while every on-chain output is unique.
-// ---------------------------------------------------------------------------
-
-pub mod kem {
-    use ml_kem::{
-        Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey, KeyExport, KeyInit, MlKem512,
-        TryKeyInit,
-    };
-    use sha2::{Digest, Sha256};
-
-    pub const KEM_PK_LEN: usize = 800;
-    pub const KEM_SK_LEN: usize = 64;
-    pub const KEM_CT_LEN: usize = 768;
-    pub const KEM_SS_LEN: usize = 32;
-
-    /// Deterministic 64-byte ML-KEM seed derived from the wallet master seed.
-    fn derive_kem_seed(master: &[u8; 32]) -> [u8; KEM_SK_LEN] {
-        let mut out = [0u8; KEM_SK_LEN];
-        let h0 = Sha256::digest([master.as_slice(), &[0u8]].concat());
-        let h1 = Sha256::digest([master.as_slice(), &[1u8]].concat());
-        out[..32].copy_from_slice(&h0);
-        out[32..].copy_from_slice(&h1);
-        out
-    }
-
-    /// Deterministic KEM keypair from the wallet master seed: returns the
-    /// 800-byte encapsulation (public) key and the 64-byte decapsulation seed.
-    /// The seed is all that must be kept secret; the public key is recomputed
-    /// from it, so the wallet stays stateless (one master seed).
-    pub fn kem_keypair_from_seed(master: &[u8; 32]) -> ([u8; KEM_PK_LEN], [u8; KEM_SK_LEN]) {
-        let sk = derive_kem_seed(master);
-        let dk: DecapsulationKey<MlKem512> = KeyInit::new_from_slice(&sk).expect("bad KEM seed");
-        let ek = dk.encapsulation_key();
-        let mut pk = [0u8; KEM_PK_LEN];
-        pk.copy_from_slice(ek.to_bytes().as_slice());
-        (pk, sk)
-    }
-
-    /// Encapsulate a shared secret to `pk`; returns (shared_secret, ciphertext).
-    pub fn kem_encaps(pk: &[u8; KEM_PK_LEN]) -> ([u8; KEM_SS_LEN], [u8; KEM_CT_LEN]) {
-        let ek: EncapsulationKey<MlKem512> =
-            TryKeyInit::new_from_slice(pk).expect("bad KEM public key");
-        let (ct, ss) = ek.encapsulate();
-        let mut out_ct = [0u8; KEM_CT_LEN];
-        out_ct.copy_from_slice(ct.as_slice());
-        (ss.0, out_ct)
-    }
-
-    /// Decapsulate the shared secret from `ct` using the 64-byte `sk` seed.
-    pub fn kem_decaps(sk: &[u8; KEM_SK_LEN], ct: &[u8; KEM_CT_LEN]) -> [u8; KEM_SS_LEN] {
-        let dk: DecapsulationKey<MlKem512> = KeyInit::new_from_slice(sk).expect("bad KEM seed");
-        let ss = dk.decapsulate_slice(ct).expect("decapsulation failed");
-        ss.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stealth addresses (reusable address + one-time WOTS+ output)
-//
-// A user's reusable address is just their KEM encapsulation public key
-// (800 bytes), encoded as a Bech32m string (HRP `litc` mainnet / `tlitc`
-// testnet). Bech32m keeps it lowercase and self-verifying, though the string
-// is still long because the full key is encoded — a truly short address needs
-// a protocol change (see docs/stealth.md). To pay it, the sender encapsulates
-// a shared secret, derives a unique WOTS+ key from it, and locks the output to
-// that key's commitment while attaching the KEM ciphertext. The recipient
-// scans the chain, decapsulates each ciphertext with their scan secret, and
-// recovers the one-time WOTS+ spend key — without ever reusing an address.
-// ---------------------------------------------------------------------------
-
-pub mod stealth {
-    use super::*;
-
-    pub const STEALTH_VERSION_MAINNET: u8 = 0x31;
-    pub const STEALTH_VERSION_TESTNET: u8 = 0x70;
-    const HRP_MAINNET: &str = "litc";
-    const HRP_TESTNET: &str = "tlitc";
-
-    const DOMAIN: &[u8] = b"litc-stealth-v1";
-
-    /// Derive the per-payment WOTS+ master seed from a KEM shared secret.
-    pub fn stealth_seed(ss: &[u8; 32]) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(DOMAIN);
-        h.update(ss);
-        let d = h.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&d);
-        out
-    }
-
-    /// The reusable (multi-use) stealth address from a KEM public key.
-    pub fn stealth_address(kem_pk: &[u8; kem::KEM_PK_LEN], version: u8) -> String {
-        let hrp = if version == STEALTH_VERSION_MAINNET {
-            HRP_MAINNET
-        } else {
-            HRP_TESTNET
-        };
-        let mut payload = Vec::with_capacity(kem::KEM_PK_LEN + 1);
-        payload.push(version);
-        payload.extend_from_slice(kem_pk);
-        bech32m_encode(hrp, &payload)
-    }
-
-    /// Parse a stealth address back into a KEM public key (or `None`).
-    pub fn parse_stealth_address(s: &str) -> Option<(u8, [u8; kem::KEM_PK_LEN])> {
-        let (hrp, body) = bech32m_decode(s)?;
-        if body.is_empty() {
-            return None;
-        }
-        let v = body[0];
-        let expected_hrp = if v == STEALTH_VERSION_MAINNET {
-            HRP_MAINNET
-        } else if v == STEALTH_VERSION_TESTNET {
-            HRP_TESTNET
-        } else {
-            return None;
-        };
-        if hrp != expected_hrp {
-            return None;
-        }
-        if body.len() != 1 + kem::KEM_PK_LEN {
-            return None;
-        }
-        let mut a = [0u8; kem::KEM_PK_LEN];
-        a.copy_from_slice(&body[1..]);
-        Some((v, a))
-    }
-
-    /// Build a one-time output paying a reusable stealth address: encapsulates
-    /// once to `kem_pk`, derives the unique WOTS+ key at index 0, and returns
-    /// `(output, ciphertext)`. The output's script is HASH160(R); the caller
-    /// must place the returned `ciphertext` in the transaction's `ephemeral`
-    /// field (aggregated stealth, see `docs/stealth.md`) so the recipient can
-    /// recover the same shared secret. Encapsulation is randomized, so the
-    /// script and ciphertext come from one encapsulation and must stay paired.
-    pub fn build_stealth_output(
-        kem_pk: &[u8; kem::KEM_PK_LEN],
-        value: Amount,
-    ) -> (TxOut, [u8; kem::KEM_CT_LEN]) {
-        let (ss, ct) = kem::kem_encaps(kem_pk);
-        let out = TxOut {
-            value,
-            script_pubkey: stealth_script(&ss, 0).to_vec(),
-            ephemeral: vec![],
-        };
-        (out, ct)
-    }
-
-    /// The locking script (HASH160(R)) for a stealth output at `index`, derived
-    /// from the shared secret `ss`.
-    pub fn stealth_script(ss: &[u8; 32], index: u32) -> [u8; 20] {
-        wots::WotsKeypair::derive(&stealth_seed(ss), index).pubkey_root_hash160()
-    }
-
-    /// Recover the one-time WOTS+ keypair for a received output, given the
-    /// recipient's KEM secret key and the output's ciphertext. Returns `None`
-    /// if `ct` is malformed. Derives at index 0.
-    pub fn recover_stealth_keypair(
-        kem_sk: &[u8; kem::KEM_SK_LEN],
-        ct: &[u8],
-    ) -> Option<wots::WotsKeypair> {
-        recover_stealth_keypair_at(kem_sk, ct, 0)
-    }
-
-    /// As `recover_stealth_keypair`, but derives the WOTS+ key at `index`
-    /// (the output's position in the funding transaction). Used when a single
-    /// transaction pays several stealth outputs from one shared secret.
-    pub fn recover_stealth_keypair_at(
-        kem_sk: &[u8; kem::KEM_SK_LEN],
-        ct: &[u8],
-        index: u32,
-    ) -> Option<wots::WotsKeypair> {
-        if ct.len() != kem::KEM_CT_LEN {
-            return None;
-        }
-        let mut c = [0u8; kem::KEM_CT_LEN];
-        c.copy_from_slice(ct);
-        let ss = kem::kem_decaps(kem_sk, &c);
-        Some(wots::WotsKeypair::derive(&stealth_seed(&ss), index))
-    }
-}
+pub mod mldsa;
 
 /// Network-wide consensus constants that a node must agree on with its peers.
 /// These are *not* negotiated on the wire; a mismatch means you are on a
@@ -1392,23 +960,6 @@ mod tests {
     }
 
     #[test]
-    fn stealth_address_bech32m() {
-        let pk = [0x37u8; kem::KEM_PK_LEN];
-        let addr = stealth::stealth_address(&pk, stealth::STEALTH_VERSION_MAINNET);
-        assert!(addr.starts_with("litc1"));
-        let (_, back) = stealth::parse_stealth_address(&addr).unwrap();
-        assert_eq!(back, pk);
-        // Testnet HRP differs; both encode the same key so they decode to the
-        // same public key, but the address strings are distinct.
-        let taddr = stealth::stealth_address(&pk, stealth::STEALTH_VERSION_TESTNET);
-        assert!(taddr.starts_with("tlitc1"));
-        assert_eq!(addr, stealth::stealth_address(&pk, stealth::STEALTH_VERSION_MAINNET));
-        assert_ne!(addr, taddr);
-        assert_eq!(stealth::parse_stealth_address(&addr).unwrap().1, pk);
-        assert_eq!(stealth::parse_stealth_address(&taddr).unwrap().1, pk);
-    }
-
-    #[test]
     fn encode_decode_transaction() {
         let tx = Transaction {
             version: 1,
@@ -1417,16 +968,14 @@ mod tests {
                     txid: Hash32([7u8; 32]),
                     index: 3,
                 },
-                scheme: SignatureScheme::Wots256,
+                scheme: SignatureScheme::Mldsa2,
                 script_sig: vec![1, 2, 3, 4],
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![TxOut {
                 value: Amount(50 * COIN),
                 script_pubkey: vec![0x76, 0xa9],
-                ephemeral: vec![],
             }],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let bytes = to_bytes(&tx);
@@ -1442,7 +991,6 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![],
-            ephemeral: vec![],
             lock_time: 0,
         };
         // Single tx -> merkle root equals its txid.
@@ -1479,48 +1027,42 @@ mod tests {
     }
 
     #[test]
-    fn wots_sign_verify() {
-        let kp = wots::WotsKeypair::derive(&[0x42u8; 32], 0);
+    fn mldsa_sign_verify() {
+        let kp = mldsa::MlDsaKeypair::derive(&[0x42u8; 32], 0);
         let msg = [0xdeu8; 32];
         let sig = kp.sign(&msg);
-        let root_hash = kp.pubkey_root_hash160();
-        assert!(sig.verify(&msg, &root_hash));
+        assert!(mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &msg, &sig));
         // Wrong message must fail.
         let bad = [0x00u8; 32];
-        assert!(!sig.verify(&bad, &root_hash));
-        // Wrong committed root must fail.
-        let wrong = [0xffu8; 20];
-        assert!(!sig.verify(&msg, &wrong));
+        assert!(!mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &bad, &sig));
     }
 
     #[test]
-    fn wots_derive_deterministic() {
-        let a = wots::WotsKeypair::derive(&[0x11u8; 32], 7);
-        let b = wots::WotsKeypair::derive(&[0x11u8; 32], 7);
-        assert_eq!(a.pubkey_root(), b.pubkey_root());
-        let c = wots::WotsKeypair::derive(&[0x11u8; 32], 8);
-        assert_ne!(a.pubkey_root(), c.pubkey_root());
+    fn mldsa_derive_deterministic() {
+        let a = mldsa::MlDsaKeypair::derive(&[0x11u8; 32], 7);
+        let b = mldsa::MlDsaKeypair::derive(&[0x11u8; 32], 7);
+        assert_eq!(a.public_key_bytes(), b.public_key_bytes());
+        let c = mldsa::MlDsaKeypair::derive(&[0x11u8; 32], 8);
+        assert_ne!(a.public_key_bytes(), c.public_key_bytes());
     }
 
     #[test]
-    fn wots_address_roundtrip() {
-        let kp = wots::WotsKeypair::derive(&[0x99u8; 32], 0);
-        let addr = kp.address(wots::MAINNET_VERSION);
-        assert!(addr.starts_with('L'));
-        let (v, h) = base58check_decode(&addr).unwrap();
-        assert_eq!(v, wots::MAINNET_VERSION);
-        assert_eq!(&h[..], &kp.pubkey_root_hash160()[..]);
+    fn mldsa_address_roundtrip() {
+        let kp = mldsa::MlDsaKeypair::derive(&[0x99u8; 32], 0);
+        let addr = kp.address(mldsa::MAINNET_VERSION);
+        assert!(addr.starts_with("litc1"));
+        let (v, hash) = mldsa::parse_address(&addr).unwrap();
+        assert_eq!(v, mldsa::MAINNET_VERSION);
+        assert_eq!(hash, kp.pubkey_hash160());
     }
 
     #[test]
-    fn wots_witness_roundtrip() {
-        let kp = wots::WotsKeypair::derive(&[0x55u8; 32], 0);
+    fn mldsa_signature_encoding_roundtrip() {
+        let kp = mldsa::MlDsaKeypair::derive(&[0x55u8; 32], 0);
         let msg = [0xaau8; 32];
         let sig = kp.sign(&msg);
-        let bytes = wots::encode_witness(&sig);
-        let back = wots::decode_witness(&bytes).unwrap();
-        let root_hash = kp.pubkey_root_hash160();
-        assert!(back.verify(&msg, &root_hash));
+        // Signature is just raw bytes; verify still works.
+        assert!(mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &msg, &sig));
     }
 
     #[test]
