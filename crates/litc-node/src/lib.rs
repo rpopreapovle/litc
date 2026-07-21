@@ -351,7 +351,6 @@ impl<S: SpendStore + StateStore> Node<S> {
         // Per-peer block rate limit (DoS guard against header-rain attacks).
         // Skip for locally mined blocks.
         if from != LOCAL && !peer_rate_allowed(&mut self.peer_block, &from, PEER_BLOCK_WINDOW, PEER_BLOCK_LIMIT) {
-            eprintln!("[p2p] peer {from} exceeded block rate limit");
             return false;
         }
         let target = self.target_for(height);
@@ -715,7 +714,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                         }]),
                         Some(&addr),
                     );
-                    println!("[p2p] accepted relayed block {}", hex(&h.0[..4]));
+
                 }
             }
             Err(e) => eprintln!("[p2p] bad block payload: {e}"),
