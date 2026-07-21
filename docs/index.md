@@ -64,5 +64,6 @@ litc/
 - [benchmarks.md](benchmarks.md) — hardware measurements.
 - [running-a-node.md](running-a-node.md) — build, configure, run.
 - [wallet.md](wallet.md) — keys, backup, transfers.
+- [uri.md](uri.md) — payment URIs, QR codes, deep links.
 - [cli.md](cli.md) — node + CLI reference.
 - [reproducible-builds.md](reproducible-builds.md) — deterministic releases.
