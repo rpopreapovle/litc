@@ -574,8 +574,11 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
     known: AddrSet,
     listen: SocketAddr,
 ) {
-    if peers.lock().unwrap().contains_key(&addr) {
-        return;
+    {
+        let p = peers.lock().unwrap();
+        if p.contains_key(&addr) || p.keys().any(|k| k.ip() == addr.ip()) {
+            return;
+        }
     }
     thread::spawn(
         move || match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
@@ -1106,6 +1109,10 @@ pub fn run(args: Vec<String>) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            // Reject duplicate connections from the same IP (different port).
+            if lpeers.lock().unwrap().keys().any(|k| k.ip() == addr.ip()) {
+                continue;
+            }
             let p = lpeers.clone();
             let nd = lnode.clone();
             let kn = lknown.clone();
