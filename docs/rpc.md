@@ -59,12 +59,39 @@ curl -s http://127.0.0.1:18334/ \
 | `get_header_by_height` | `[height]` | Hex-encoded block header |
 | `get_network_params` | `[]` | Chain parameters (subsidy, halving, etc.) |
 
-### Mining
+### Mining / Pool
 
 | Method | Params | Returns |
 |---|---|---|
 | `getmininginfo` | `[]` | Height, difficulty bits, mempool count |
-| `submitblock` | `[hex]` | `true` if block was accepted |
+| `getblocktemplate` | `[worker_name?]` | Block template for remote miners (see below) |
+| `submitblock` | `[hex, worker_name?]` | `true` if block was accepted; tracks submitter |
+| `getpoolinfo` | `[]` | Pool worker stats (blocks found, last height) |
+
+#### `getblocktemplate`
+
+Returns everything a remote miner needs to search for a valid nonce:
+
+```json
+{
+  "height": 42,
+  "header_hex": "...",       // serialized BlockHeader (nonce=0)
+  "target_hex": "...",       // network target (32 bytes, little-endian)
+  "prev_block": "...",       // previous block hash
+  "epoch_seed": "...",       // epoch seed for scratchpad
+  "state_root": "...",       // committed post-state root
+  "coinbase_value": 5000000000
+}
+```
+
+The miner:
+1. Parses `header_hex`, zeroes the nonce field (last 8 bytes)
+2. Computes SHA-256d of the header *without* the nonce → challenge
+3. Prepares the epoch scratchpad from `epoch_seed` (512 MB, once per epoch)
+4. Iterates nonces: `digest = litehash(scratch, nonce, challenge)`
+5. Submits the full block (with winning nonce) via `submitblock`
+
+All LiteHash parameters (LANES, WALK) must match the network — use the same `litc-pow` crate.
 
 ### Network
 
