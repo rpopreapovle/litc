@@ -33,8 +33,7 @@ litc node --gpu
 litc node --port 8333 --rpc-port 18334
 # Bootstrap from an explicit seed.
 litc node --seed 1.2.3.4:8333
-# Bind a specific listen address.
-litc node --listen 0.0.0.0:8333 --seed seed.example.com:8333
+# Note: P2P binds 0.0.0.0:PORT; RPC always on 127.0.0.1.
 ```
 
 Node flags:
@@ -43,7 +42,6 @@ Node flags:
 |-----------------------|------------------------------------------------------------|
 | `--port N`            | listen port (default 8333)                                 |
 | `--rpc-port N`        | enable JSON-RPC API on this port                           |
-| `--listen IP:PORT`    | address to bind and advertise (default `127.0.0.1:N`)      |
 | `--connect A`         | dial peer `A` on startup (added to gossip set)             |
 | `--seed A`            | alias for `--connect`                                      |
 | `--no-mine`           | relay + sync only, do not mine                             |

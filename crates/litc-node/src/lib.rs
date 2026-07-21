@@ -994,7 +994,7 @@ pub fn run(args: Vec<String>) {
         }
     }
 
-    let listen: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+    let listen: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
     let data_dir = std::env::var("LITC_DATADIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("data"));

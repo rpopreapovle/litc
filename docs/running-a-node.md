@@ -51,6 +51,8 @@ cargo run -p litc-node --features litc-pow/small -- --port 8333 --rpc-port 18334
 | `--save-snapshot <path>` | — | Write state snapshot to `path` |
 | `--network <name>` | `testnet` | `testnet` or `mainnet` |
 
+P2P binds `0.0.0.0:PORT`. RPC binds `127.0.0.1:RPC-PORT` (localhost only).
+
 ## Environment
 
 | Variable | Default | Description |
