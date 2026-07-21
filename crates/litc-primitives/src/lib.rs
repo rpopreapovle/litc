@@ -1226,11 +1226,15 @@ pub mod chainparams {
             }
         }
 
-        pub fn from_str(s: &str) -> Option<Network> {
+    }
+
+    impl std::str::FromStr for Network {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s.to_ascii_lowercase().as_str() {
-                "mainnet" => Some(Network::Mainnet),
-                "testnet" => Some(Network::Testnet),
-                _ => None,
+                "mainnet" => Ok(Network::Mainnet),
+                "testnet" => Ok(Network::Testnet),
+                _ => Err(format!("unknown network: {s}")),
             }
         }
     }
@@ -1529,8 +1533,8 @@ mod tests {
         assert_eq!(t.halving_interval, 10_000);
         assert_eq!(m.halving_interval, 8_400_000);
         assert_eq!(t.network.as_str(), "testnet");
-        assert_eq!(chainparams::Network::from_str("MAINNET"), Some(chainparams::Network::Mainnet));
-        assert_eq!(chainparams::Network::from_str("nope"), None);
+        assert_eq!("MAINNET".parse::<chainparams::Network>(), Ok(chainparams::Network::Mainnet));
+        assert_eq!("nope".parse::<chainparams::Network>(), Err("unknown network: nope".to_string()));
     }
 
     #[test]

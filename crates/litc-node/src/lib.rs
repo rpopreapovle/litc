@@ -573,22 +573,24 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
     node: Arc<Mutex<Node<S>>>,
     known: AddrSet,
     listen: SocketAddr,
+    connecting: &AddrSet,
 ) {
-    {
-        let p = peers.lock().unwrap();
-        if p.contains_key(&addr) || p.keys().any(|k| k.ip() == addr.ip()) {
-            return;
-        }
+    if peers.lock().unwrap().contains_key(&addr) || !connecting.lock().unwrap().insert(addr) {
+        return;
     }
+    let cn = connecting.clone();
     thread::spawn(
         move || match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
             Ok(s) => {
                 // For an outbound connection the address we dialed is the peer's
                 // listening address, so it's safe to record it for gossip.
                 known.lock().unwrap().insert(addr);
-                handle_conn(s, addr, peers, node, known, listen);
+                handle_conn(s, addr, peers, node, known, listen, &cn);
             }
-            Err(e) => eprintln!("connect to {addr} failed: {e}"),
+            Err(e) => {
+                eprintln!("connect to {addr} failed: {e}");
+                cn.lock().unwrap().remove(&addr);
+            }
         },
     );
 }
@@ -604,6 +606,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
     peers: &PeerMap,
     known: &AddrSet,
     listen: SocketAddr,
+    connecting: &AddrSet,
 ) {
     let codec = Codec::new(node.lock().unwrap().params.magic);
     match msg {
@@ -696,7 +699,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
             for sa in new_peers {
                 let already = peers.lock().unwrap().contains_key(&sa);
                 if !already {
-                    connect_to(sa, peers.clone(), node.clone(), known.clone(), listen);
+                    connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
                 }
             }
         }
@@ -752,6 +755,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
     node: Arc<Mutex<Node<S>>>,
     known: AddrSet,
     listen: SocketAddr,
+    connecting: &AddrSet,
 ) {
     let writer = match stream.try_clone() {
         Ok(w) => Arc::new(Mutex::new(w)),
@@ -799,7 +803,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
             match codec.parse(&buf) {
                 Ok(Some((msg, consumed))) => {
                     buf.drain(..consumed);
-                    on_message(addr, msg, &node, &peers, &known, listen);
+                    on_message(addr, msg, &node, &peers, &known, listen, connecting);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -810,6 +814,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
         }
     }
     peers.lock().unwrap().remove(&addr);
+    connecting.lock().unwrap().remove(&addr);
     println!("[p2p] peer disconnected {addr}");
 }
 
@@ -1023,7 +1028,7 @@ pub fn run(args: Vec<String>) {
             }
             "--network" => {
                 if let Some(n) = args.get(i + 1) {
-                    if let Some(net) = Network::from_str(n) {
+                    if let Ok(net) = n.parse() {
                         network = net;
                     }
                 }
@@ -1043,7 +1048,7 @@ pub fn run(args: Vec<String>) {
     // is testnet. Checkpoints are empty on a fresh testnet and pinned at launch.
     let network = std::env::var("LITC_NETWORK")
         .ok()
-        .and_then(|v| Network::from_str(&v))
+        .and_then(|v| v.parse().ok())
         .unwrap_or(network);
     let params = match network {
         Network::Mainnet => ChainParams::mainnet(),
@@ -1097,11 +1102,13 @@ pub fn run(args: Vec<String>) {
     // the `litc wallet send*` commands) and relay them.
     load_mempool(&data_dir, &node, &peers);
 
+    let connecting: AddrSet = Arc::new(Mutex::new(HashSet::new()));
     let listener = TcpListener::bind(listen).expect("cannot bind port");
     println!("listening on {listen}");
     let lpeers = peers.clone();
     let lnode = node.clone();
     let lknown = known.clone();
+    let lconnecting = connecting.clone();
     let llisten = listen;
     thread::spawn(move || {
         for s in listener.incoming().flatten() {
@@ -1109,14 +1116,11 @@ pub fn run(args: Vec<String>) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            // Reject duplicate connections from the same IP (different port).
-            if lpeers.lock().unwrap().keys().any(|k| k.ip() == addr.ip()) {
-                continue;
-            }
             let p = lpeers.clone();
             let nd = lnode.clone();
             let kn = lknown.clone();
-            thread::spawn(move || handle_conn(s, addr, p, nd, kn, llisten));
+            let cn = lconnecting.clone();
+            thread::spawn(move || handle_conn(s, addr, p, nd, kn, llisten, &cn));
         }
     });
 
@@ -1139,7 +1143,7 @@ pub fn run(args: Vec<String>) {
                 continue;
             }
         };
-        connect_to(addr, p, nd, kn, listen);
+        connect_to(addr, p, nd, kn, listen, &connecting);
     }
 
     if mine {

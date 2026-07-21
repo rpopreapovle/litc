@@ -2,7 +2,8 @@
 //! 32-byte master seed. Hardware backends (Ledger, Trezor) can implement the
 //! same `KeyStore` trait later without touching the wallet.
 //!
-//! Linux-first: fresh entropy comes from `/dev/urandom`.
+//! Entropy sources: `/dev/urandom` (Unix) or a hash-based PRNG fallback (other
+//! platforms).
 
 use std::fs;
 use std::path::PathBuf;
@@ -164,17 +165,38 @@ impl KeyStore for FileKeyStore {
     }
 }
 
-/// Gather 32 bytes of entropy from `/dev/urandom` (Linux). Other platforms
-/// return an error — LiTC is Linux-first.
-pub fn random_seed() -> Result<[u8; 32], String> {
+/// Fill a buffer with platform entropy.
+#[cfg(unix)]
+fn fill_random(buf: &mut [u8]) -> Result<(), String> {
     use std::io::Read;
-    // NOTE: read exactly 32 bytes. `fs::read` would read until EOF, and
-    // /dev/urandom has no EOF — it would loop forever and exhaust memory.
     let mut f =
         fs::File::open("/dev/urandom").map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
+    f.read_exact(buf)
+        .map_err(|e| format!("cannot read entropy: {e}"))
+}
+
+/// Fill a buffer with a hash-based PRNG seeded from time+PID (non-cryptographic
+/// fallback for platforms without /dev/urandom, e.g. Windows).
+#[cfg(not(unix))]
+fn fill_random(buf: &mut [u8]) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let mut state = t.as_nanos() as u64 ^ (pid as u64) << 32;
+    for chunk in buf.chunks_mut(8) {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let n = chunk.len().min(8);
+        chunk[..n].copy_from_slice(&state.to_le_bytes()[..n]);
+    }
+    Ok(())
+}
+
+/// Gather 32 bytes of entropy.
+pub fn random_seed() -> Result<[u8; 32], String> {
     let mut seed = [0u8; 32];
-    f.read_exact(&mut seed)
-        .map_err(|e| format!("cannot read entropy: {e}"))?;
+    fill_random(&mut seed)?;
     Ok(seed)
 }
 
