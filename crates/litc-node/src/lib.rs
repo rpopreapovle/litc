@@ -133,6 +133,17 @@ const PEER_BLOCK_LIMIT: usize = 200;
 /// directory), which is trusted and not rate-limited in the same way.
 const LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
 
+// ANSI color helpers for structured logging.
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BLUE: &str = "\x1b[34m";
+const MAGENTA: &str = "\x1b[35m";
+const CYAN: &str = "\x1b[36m";
+
 /// A worker registered with the built-in mining pool.
 #[derive(Clone)]
 pub(crate) struct PoolWorker {
@@ -471,12 +482,12 @@ impl<S: SpendStore + StateStore> Node<S> {
         }
         // Bound memory usage if a peer floods us with valid transactions.
         if self.mempool.len() >= MAX_MEMPOOL {
-            eprintln!("[mempool] full ({}), dropping tx", self.mempool.len());
+            eprintln!("{YELLOW}{BOLD}[mempool]{RESET} full ({}), dropping tx", self.mempool.len());
             return false;
         }
         // Per-peer transaction rate limit (DoS guard).
         if !peer_rate_allowed(&mut self.peer_tx, &from, PEER_TX_WINDOW, PEER_TX_LIMIT) {
-            eprintln!("[p2p] peer {from} exceeded tx rate limit");
+            eprintln!("{YELLOW}{BOLD}[p2p]{RESET} {YELLOW}peer {from} exceeded tx rate limit{RESET}");
             return false;
         }
         // Validate against the current UTXO set at the prospective next height.
@@ -583,15 +594,15 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
         }
         let p = peers.lock().unwrap();
         if p.contains_key(&addr) {
-            eprintln!("[p2p] connect_to skip {addr} (already in peers)");
+            eprintln!("{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already in peers){RESET}");
             return;
         }
         if !connecting.lock().unwrap().insert(addr) {
-            eprintln!("[p2p] connect_to skip {addr} (already connecting)");
+            eprintln!("{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already connecting){RESET}");
             return;
         }
     }
-    eprintln!("[p2p] connect_to proceed {addr}");
+    eprintln!("{CYAN}{BOLD}[p2p]{RESET} {CYAN}connect_to {addr}{RESET}");
     let cn = connecting.clone();
     thread::spawn(
         move || match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
@@ -602,7 +613,7 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
                 handle_conn(s, addr, peers, node, known, listen, &cn);
             }
             Err(e) => {
-                eprintln!("connect to {addr} failed: {e}");
+                eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}connect to {addr} failed: {e}{RESET}");
                 cn.lock().unwrap().remove(&addr);
             }
         },
@@ -629,14 +640,14 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 let map = peers.lock().unwrap();
                 // If this nonce matches our own, the peer connected to itself — drop.
                 if peer_nonce == node.lock().unwrap().my_nonce {
-                    eprintln!("[p2p] dropping self-connection from {addr}");
+                    eprintln!("{YELLOW}{BOLD}[p2p]{RESET} {YELLOW}dropping self-connection from {addr}{RESET}");
                     return false;
                 }
                 // If this nonce matches another peer, it's a duplicate connection
                 // from the same node (different source port) — drop.
                 for (other_addr, other_peer) in map.iter() {
                     if *other_addr != addr && other_peer.nonce == Some(peer_nonce) {
-                        eprintln!("[p2p] dropping duplicate connection from {addr} (same nonce as {other_addr})");
+                        eprintln!("{YELLOW}{BOLD}[p2p]{RESET} {YELLOW}dropping duplicate from {addr} (same nonce as {other_addr}){RESET}");
                         return false;
                     }
                 }
@@ -656,7 +667,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
         Message::Verack => {
             if let Some(p) = peers.lock().unwrap().get_mut(&addr) {
                 p.handshaked = true;
-                println!("[p2p] handshake complete with {addr}");
+                println!("{GREEN}{BOLD}[p2p]{RESET} {GREEN}handshake complete with {addr}{RESET}");
             }
             // On handshake, ask the peer for its chain tip (initial sync) and
             // for more peer addresses (bootstrap/gossip).
@@ -737,12 +748,12 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
             }
             // Connect to any newly-learned addresses we aren't already peered with.
             for sa in &new_peers {
-                eprintln!("[p2p] Addr handler: new_peer={sa}");
+                eprintln!("{CYAN}{BOLD}[p2p]{RESET} {DIM}new peer discovered: {sa}{RESET}");
             }
             for sa in new_peers {
                 let already = peers.lock().unwrap().contains_key(&sa);
                 if !already {
-                    eprintln!("[p2p] Addr handler -> connect_to {sa}");
+                    eprintln!("{CYAN}{BOLD}[p2p]{RESET} {CYAN}connecting to {sa}{RESET}");
                     connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
                 }
             }
@@ -764,7 +775,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
 
                 }
             }
-            Err(e) => eprintln!("[p2p] bad block payload: {e}"),
+            Err(e) => eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}bad block payload: {e}{RESET}"),
         },
         Message::Tx(raw) => match Transaction::decode(&mut Reader::new(&raw)) {
             Ok(tx) => {
@@ -780,10 +791,10 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                         }]),
                         Some(&addr),
                     );
-                    println!("[p2p] accepted relayed tx {}", hex(&id.0[..4]));
+                    println!("{GREEN}{BOLD}[p2p]{RESET} {GREEN}accepted relayed tx {}{RESET}", hex(&id.0[..4]));
                 }
             }
-            Err(e) => eprintln!("[p2p] bad tx payload: {e}"),
+            Err(e) => eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}bad tx payload: {e}{RESET}"),
         },
         Message::Ping(n) => send_msg(peers, &addr, &codec, &Message::Pong(n)),
         Message::Pong(_) | Message::Request { .. } | Message::Response { .. } => {}
@@ -842,7 +853,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
         }
         // DoS guard: bound unparsed buffer growth.
         if buf.len() > litc_wire::MAX_FRAME * 2 {
-            eprintln!("[p2p] peer {addr} exceeded buffer limit; dropping");
+            eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}peer {addr} exceeded buffer limit; dropping{RESET}");
             break;
         }
         let mut disconnected = false;
@@ -857,7 +868,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("[p2p] wire error from {addr}: {e}");
+                    eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}wire error from {addr}: {e}{RESET}");
                     return;
                 }
             }
@@ -868,7 +879,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
     }
     peers.lock().unwrap().remove(&addr);
     connecting.lock().unwrap().remove(&addr);
-    println!("[p2p] peer disconnected {addr}");
+    println!("{DIM}{BOLD}[p2p]{RESET} {DIM}peer disconnected {addr}{RESET}");
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +915,7 @@ fn miner_loop<S: SpendStore + StateStore>(
         let block = match miner.mine_block(&template, &target) {
             Some(b) => b,
             None => {
-                eprintln!("[mine] search space exhausted");
+                eprintln!("{YELLOW}{BOLD}[mine]{RESET} {YELLOW}search space exhausted{RESET}");
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
@@ -922,9 +933,11 @@ fn miner_loop<S: SpendStore + StateStore>(
                 None,
             );
             println!(
-                "[mine] block #{} hash={}",
+                "{GREEN}{BOLD}[mine]{RESET} {GREEN}block #{} hash={}{}{}",
                 block.header.height,
-                hex(&h.0[..4])
+                BOLD,
+                hex(&h.0[..4]),
+                RESET
             );
         }
         thread::sleep(Duration::from_millis(1500));
@@ -965,7 +978,7 @@ fn load_mempool<S: SpendStore + StateStore>(
         let tx = match Transaction::decode(&mut Reader::new(&bytes)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[mempool] bad tx file {}: {e}", path.display());
+                eprintln!("{RED}{BOLD}[mempool]{RESET} {RED}bad tx file {}: {e}{RESET}", path.display());
                 continue;
             }
         };
@@ -982,7 +995,7 @@ fn load_mempool<S: SpendStore + StateStore>(
                 None,
             );
             let _ = std::fs::remove_file(&path);
-            println!("[mempool] loaded tx {}", hex(&id.0[..4]));
+            println!("{GREEN}{BOLD}[mempool]{RESET} {GREEN}loaded tx {}{RESET}", hex(&id.0[..4]));
         }
     }
 }
@@ -1107,12 +1120,12 @@ pub fn run(args: Vec<String>) {
         Network::Mainnet => ChainParams::mainnet(),
         Network::Testnet => ChainParams::testnet(),
     };
-    println!("[net] network = {}", network.as_str());
+    println!("{MAGENTA}{BOLD}[net]{RESET} {MAGENTA}network = {}{RESET}", network.as_str());
 
     // `--verify-from-genesis` intentionally wipes any existing state so the node
     // re-derives everything from block 0 (the only fully trustless path).
     if verify_from_genesis {
-        eprintln!("[warn] --verify-from-genesis: discarding existing chain state");
+        eprintln!("{RED}{BOLD}[warn]{RESET} {RED}--verify-from-genesis: discarding existing chain state{RESET}");
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -1125,7 +1138,7 @@ pub fn run(args: Vec<String>) {
     // Either fast-sync from a snapshot (trustless verify on load) or open the
     // local chain store.
     let store = if let Some(snap) = &fast_sync {
-        println!("[fast-sync] loading snapshot from {snap}");
+        println!("{CYAN}{BOLD}[fast-sync]{RESET} {CYAN}loading snapshot from {snap}{RESET}");
         FileStore::load_snapshot(snap, &params).expect("cannot load snapshot (state_root mismatch?)")
     } else {
         FileStore::open(data_dir.clone(), prune).expect("cannot open chain store")
@@ -1134,7 +1147,7 @@ pub fn run(args: Vec<String>) {
     if let Some(snap) = &save_snapshot {
         let path = std::path::PathBuf::from(snap);
         store.save_snapshot(&path).expect("cannot save snapshot");
-        println!("[snapshot] saved to {snap}");
+        println!("{CYAN}{BOLD}[snapshot]{RESET} {CYAN}saved to {snap}{RESET}");
     }
     let node = Arc::new(Mutex::new(Node::<FileStore>::new(store, seed, params)));
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1172,7 +1185,7 @@ pub fn run(args: Vec<String>) {
 
     let connecting: AddrSet = Arc::new(Mutex::new(HashSet::new()));
     let listener = TcpListener::bind(listen).expect("cannot bind port");
-    println!("listening on {listen}");
+    println!("{MAGENTA}{BOLD}[net]{RESET} {MAGENTA}listening on {listen}{RESET}");
     let lpeers = peers.clone();
     let lnode = node.clone();
     let lknown = known.clone();
@@ -1193,7 +1206,7 @@ pub fn run(args: Vec<String>) {
     });
 
     for addr in &connect_targets {
-        eprintln!("[p2p] connect_targets: {addr}");
+        eprintln!("{CYAN}{BOLD}[p2p]{RESET} {DIM}seed target: {addr}{RESET}");
     }
     for addr in connect_targets {
         let p = peers.clone();
@@ -1208,18 +1221,18 @@ pub fn run(args: Vec<String>) {
             {
                 match WgpuMiner::new() {
                     Ok(m) => {
-                        println!("[gpu] mining backend: wgpu (Vulkan)");
+                        println!("{MAGENTA}{BOLD}[gpu]{RESET} {MAGENTA}mining backend: wgpu (Vulkan){RESET}");
                         Box::new(m)
                     }
                     Err(e) => {
-                        eprintln!("[gpu] init failed: {e}; falling back to CPU");
+                        eprintln!("{RED}{BOLD}[gpu]{RESET} {RED}init failed: {e}; falling back to CPU{RESET}");
                         Box::new(CpuMiner)
                     }
                 }
             }
             #[cfg(not(feature = "gpu"))]
             {
-                eprintln!("[gpu] node built without --features gpu; using CPU miner");
+                eprintln!("{YELLOW}{BOLD}[gpu]{RESET} {YELLOW}node built without --features gpu; using CPU miner{RESET}");
                 Box::new(CpuMiner)
             }
         } else {
@@ -1229,7 +1242,7 @@ pub fn run(args: Vec<String>) {
         let mpeers = peers.clone();
         thread::spawn(move || miner_loop(mnode, mpeers, miner));
     } else {
-        println!("mining disabled (--no-mine)");
+        println!("{DIM}{BOLD}[mine]{RESET} {DIM}mining disabled (--no-mine){RESET}");
     }
 
     if let Some(rpc_port) = rpc_port {
@@ -1247,7 +1260,7 @@ pub fn run(args: Vec<String>) {
         load_mempool(&data_dir, &node, &peers);
         let n = node.lock().unwrap();
         println!(
-            "[status] height={} blocks={} known_txs={} mempool={} diff_bits={} peers={}",
+            "{BLUE}{BOLD}[status]{RESET} {BLUE}height={} blocks={} known_txs={} mempool={} diff_bits={} peers={}{RESET}",
             n.best_height(),
             n.known_blocks.len(),
             n.known_txs.len(),

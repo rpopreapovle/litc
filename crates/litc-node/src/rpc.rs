@@ -6,6 +6,12 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+// ANSI color helpers (mirrored from lib.rs).
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const RED: &str = "\x1b[31m";
+const MAGENTA: &str = "\x1b[35m";
+
 use litc_keystore::FileKeyStore;
 use litc_primitives::{
     to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
@@ -636,11 +642,11 @@ pub fn start(
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[rpc] cannot bind {addr}: {e}");
+            eprintln!("{RED}{BOLD}[rpc]{RESET} {RED}cannot bind {addr}: {e}{RESET}");
             return;
         }
     };
-    println!("[rpc] listening on {addr}");
+    println!("{MAGENTA}{BOLD}[rpc]{RESET} {MAGENTA}listening on {addr}{RESET}");
 
     for stream in listener.incoming().flatten() {
         let node = node.clone();
