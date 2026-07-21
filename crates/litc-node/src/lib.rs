@@ -807,6 +807,15 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
     let best = node.lock().unwrap().best_height();
     let nonce = node.lock().unwrap().my_nonce;
     let codec = Codec::new(node.lock().unwrap().params.magic);
+    // For the Version handshake, advertise our actual reachable address.
+    // If we bound to 0.0.0.0, derive the real IP from the connection's
+    // local address so peers see a routable address instead of 0.0.0.0.
+    let from_addr = stream.local_addr().unwrap_or(listen);
+    let from = if listen.ip().is_unspecified() {
+        SocketAddr::new(from_addr.ip(), listen.port())
+    } else {
+        listen
+    };
     send_msg(
         &peers,
         &addr,
@@ -815,7 +824,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
             version: 1,
             services: 1,
             timestamp: now_secs(),
-            from: socket_to_netaddr(listen).unwrap(),
+            from: socket_to_netaddr(from).unwrap(),
             nonce,
             best_height: best,
         },
