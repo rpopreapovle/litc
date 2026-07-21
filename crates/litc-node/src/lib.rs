@@ -504,7 +504,7 @@ const MAX_SYNC_INV: usize = 2000;
 struct Peer {
     writer: Arc<Mutex<TcpStream>>,
     handshaked: bool,
-    listening_addr: Option<SocketAddr>,
+    nonce: Option<u64>,
 }
 
 fn is_handshake(m: &Message) -> bool {
@@ -624,29 +624,29 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
 ) -> bool {
     let codec = Codec::new(node.lock().unwrap().params.magic);
     match msg {
-        Message::Version { from, .. } => {
-            if let Some(sa) = netaddr_to_socket(&from) {
-                // If the peer sent 0.0.0.0 as its listening address (bound
-                // to the wildcard), use the actual remote socket address
-                // instead — that's how we can reach it.
-                let effective = if sa.ip().is_unspecified() { addr } else { sa };
-                let mut map = peers.lock().unwrap();
-                // Check if we're already connected to this peer's listening address.
+        Message::Version { from, nonce: peer_nonce, .. } => {
+            {
+                let map = peers.lock().unwrap();
+                // If this nonce matches our own, the peer connected to itself — drop.
+                if peer_nonce == node.lock().unwrap().my_nonce {
+                    eprintln!("[p2p] dropping self-connection from {addr}");
+                    return false;
+                }
+                // If this nonce matches another peer, it's a duplicate connection
+                // from the same node (different source port) — drop.
                 for (other_addr, other_peer) in map.iter() {
-                    if *other_addr != addr
-                        && other_peer.handshaked
-                        && other_peer.listening_addr == Some(effective)
-                    {
-                        eprintln!("[p2p] dropping duplicate connection from {effective} (already connected via {other_addr})");
+                    if *other_addr != addr && other_peer.nonce == Some(peer_nonce) {
+                        eprintln!("[p2p] dropping duplicate connection from {addr} (same nonce as {other_addr})");
                         return false;
                     }
                 }
-                // Store the listening address for future dedup checks.
-                if let Some(p) = map.get_mut(&addr) {
-                    p.listening_addr = Some(effective);
-                }
-                drop(map);
-                // Only gossip routable addresses — skip 0.0.0.0.
+            }
+            // Store the nonce for future dedup checks.
+            if let Some(p) = peers.lock().unwrap().get_mut(&addr) {
+                p.nonce = Some(peer_nonce);
+            }
+            // Record the peer's listening address for gossip (skip 0.0.0.0).
+            if let Some(sa) = netaddr_to_socket(&from) {
                 if !sa.ip().is_unspecified() {
                     known.lock().unwrap().insert(sa);
                 }
@@ -740,11 +740,7 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 eprintln!("[p2p] Addr handler: new_peer={sa}");
             }
             for sa in new_peers {
-                let already = {
-                    let map = peers.lock().unwrap();
-                    map.contains_key(&sa)
-                        || map.values().any(|p| p.listening_addr == Some(sa))
-                };
+                let already = peers.lock().unwrap().contains_key(&sa);
                 if !already {
                     eprintln!("[p2p] Addr handler -> connect_to {sa}");
                     connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
@@ -815,22 +811,13 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
         Peer {
             writer,
             handshaked: false,
-            listening_addr: None,
+            nonce: None,
         },
     );
 
     let best = node.lock().unwrap().best_height();
     let nonce = node.lock().unwrap().my_nonce;
     let codec = Codec::new(node.lock().unwrap().params.magic);
-    // For the Version handshake, advertise our actual reachable address.
-    // If we bound to 0.0.0.0, derive the real IP from the connection's
-    // local address so peers see a routable address instead of 0.0.0.0.
-    let from_addr = stream.local_addr().unwrap_or(listen);
-    let from = if listen.ip().is_unspecified() {
-        SocketAddr::new(from_addr.ip(), listen.port())
-    } else {
-        listen
-    };
     send_msg(
         &peers,
         &addr,
@@ -839,7 +826,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
             version: 1,
             services: 1,
             timestamp: now_secs(),
-            from: socket_to_netaddr(from).unwrap(),
+            from: socket_to_netaddr(listen).unwrap(),
             nonce,
             best_height: best,
         },
