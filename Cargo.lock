@@ -807,12 +807,17 @@ name = "litc-cli"
 version = "0.1.0"
 dependencies = [
  "bip39",
+ "hex",
  "litc-core",
  "litc-keystore",
+ "litc-miner",
  "litc-node",
+ "litc-pow",
  "litc-primitives",
  "litc-store",
  "litc-wallet",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

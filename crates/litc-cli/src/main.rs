@@ -19,11 +19,16 @@
 use std::env;
 use std::path::PathBuf;
 
+use std::thread;
+
 use bip39::{Language, Mnemonic};
 use litc_keystore::{FileKeyStore, KeyStore};
-use litc_primitives::{to_bytes, Amount, Hash32, Transaction, COIN};
+use litc_pow::{meets_target, mine, prepare_epoch};
+use litc_primitives::{sha256d, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN};
 use litc_store::FileStore;
 use litc_wallet::Wallet;
+
+use serde_json::json;
 
 fn datadir() -> PathBuf {
     env::var("LITC_DATADIR")
@@ -207,10 +212,103 @@ fn parse_from(rest: &[String]) -> u32 {
     0
 }
 
+/// Call a JSON-RPC method on a pool node. Returns the result value.
+fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+    let resp = ureq::post(url)
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|e| format!("RPC error: {e}"))?;
+    let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad JSON: {e}"))?;
+    if let Some(e) = v.get("error") {
+        if !e.is_null() {
+            return Err(format!("RPC error: {e}"));
+        }
+    }
+    v.get("result")
+        .cloned()
+        .ok_or_else(|| "no result in RPC response".to_string())
+}
+
+/// Pool mining client: fetches block templates from a pool node and mines them.
+fn cmd_pool_mine(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: litc pool-mine <rpc-url> [worker-name]");
+        return;
+    }
+    let url = args[0].trim_end_matches('/');
+    let worker = args.get(1).cloned().unwrap_or_default();
+    let mut nonce_start: u64 = {
+        let seed = litc_keystore::random_seed().unwrap_or([0u8; 32]);
+        u64::from_be_bytes(seed[..8].try_into().unwrap())
+    };
+    let mut last_epoch = Hash32([0u8; 32]);
+    let mut scratch: Option<litc_pow::Scratch> = None;
+    loop {
+        // Fetch a fresh block template.
+        let tmpl = match rpc_call(&url, "getblocktemplate", json!([worker])) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("[pool] {e}"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+        };
+        let block_hex = tmpl["block_hex"].as_str().unwrap_or("");
+        let target_hex = tmpl["target_hex"].as_str().unwrap_or("");
+        let height = tmpl["height"].as_u64().unwrap_or(0);
+        let block_bytes = match hex::decode(block_hex) {
+            Ok(b) => b,
+            Err(_) => { eprintln!("[pool] bad block hex"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+        };
+        let target = match hex::decode(target_hex) {
+            Ok(b) if b.len() == 32 => { let mut t = [0u8; 32]; t.copy_from_slice(&b); t }
+            _ => { eprintln!("[pool] bad target"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+        };
+        let mut block = match Block::decode(&mut Reader::new(&block_bytes)) {
+            Ok(b) => b,
+            Err(_) => { eprintln!("[pool] bad block"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+        };
+        // Prepare scratchpad once per epoch.
+        let epoch_seed = block.header.epoch_seed;
+        if scratch.is_none() || epoch_seed != last_epoch {
+            scratch = Some(prepare_epoch(&epoch_seed.0));
+            last_epoch = epoch_seed;
+            eprintln!("[pool] new epoch at height {height}");
+        }
+        // Compute the PoW challenge (SHA-256d of header without nonce).
+        let mut hb = to_bytes(&block.header);
+        hb.truncate(hb.len() - 8);
+        let challenge = sha256d(&hb).0;
+        let mut nonce = nonce_start;
+        let start = nonce;
+        loop {
+            let digest = mine(scratch.as_ref().unwrap(), nonce, &challenge);
+            if meets_target(&digest, &target) {
+                block.header.nonce = nonce;
+                let submit_hex: String = to_bytes(&block).iter().map(|b| format!("{b:02x}")).collect();
+                match rpc_call(&url, "submitblock", json!([submit_hex, worker])) {
+                    Ok(_) => eprintln!("[pool] block #{height} found! nonce={nonce}"),
+                    Err(e) => eprintln!("[pool] submit failed: {e}"),
+                }
+                nonce_start = nonce.wrapping_add(1);
+                break;
+            }
+            nonce = nonce.wrapping_add(1);
+            if nonce == start {
+                eprintln!("[pool] height {height}: nonce space exhausted");
+                thread::sleep(std::time::Duration::from_secs(1));
+                break;
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: litc <node|wallet> [...]");
+        eprintln!("usage: litc <node|wallet|pool-mine> [...]");
         return;
     }
     match args[1].as_str() {
@@ -221,6 +319,7 @@ fn main() {
             litc_node::run(v);
         }
         "wallet" => cmd_wallet(&args[2..]),
-        other => eprintln!("unknown subcommand: {other} (expected `node` or `wallet`)"),
+        "pool-mine" => cmd_pool_mine(&args[2..]),
+        other => eprintln!("unknown subcommand: {other} (expected `node` | `wallet` | `pool-mine`)"),
     }
 }

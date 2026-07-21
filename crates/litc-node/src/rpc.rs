@@ -308,10 +308,13 @@ fn handle_getblocktemplate(node: &mut Node<FileStore>, params: &[Value], id: Val
         });
     }
     let (template, target) = node.make_template();
-    let header_nonce0 = to_bytes(&crate::assemble_block(&template).header);
+    let candidate = crate::assemble_block(&template);
+    let header_nonce0 = to_bytes(&candidate.header);
+    let block_hex = to_bytes(&candidate);
     ok(json!({
         "height": template.height,
         "header_hex": hex::encode(&header_nonce0),
+        "block_hex": hex::encode(&block_hex),
         "target_hex": hex::encode(&target),
         "prev_block": template.prev_block.to_hex(),
         "epoch_seed": template.epoch_seed.to_hex(),

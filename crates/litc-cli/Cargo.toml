@@ -10,9 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 bip39 = "2"
+hex = "0.4"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
 litc-node = { path = "../litc-node" }
 litc-wallet = { path = "../litc-wallet" }
 litc-keystore = { path = "../litc-keystore" }
 litc-store = { path = "../litc-store" }
 litc-core = { path = "../litc-core" }
+litc-miner = { path = "../litc-miner" }
+litc-pow = { path = "../litc-pow" }
 litc-primitives = { path = "../litc-primitives" }
