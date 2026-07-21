@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1056,6 +1056,10 @@ pub fn run(args: Vec<String>) {
     for s in cfg.seeds.iter().chain(connects.iter()) {
         if let Ok(addr) = s.parse::<SocketAddr>() {
             known.lock().unwrap().insert(addr);
+        } else if let Ok(mut addrs) = s.to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                known.lock().unwrap().insert(addr);
+            }
         }
     }
 
@@ -1086,13 +1090,17 @@ pub fn run(args: Vec<String>) {
         let p = peers.clone();
         let nd = node.clone();
         let kn = known.clone();
-        connect_to(
-            c.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-            p,
-            nd,
-            kn,
-            listen,
-        );
+        // Resolve hostname → IP (supports both "1.2.3.4:8333" and "host.com:8333").
+        let addrs: Vec<SocketAddr> = match c.to_socket_addrs() {
+            Ok(mut a) => a.collect(),
+            Err(_) => {
+                eprintln!("cannot resolve {c}");
+                continue;
+            }
+        };
+        for addr in addrs {
+            connect_to(addr, p.clone(), nd.clone(), kn.clone(), listen);
+        }
     }
 
     if mine {
