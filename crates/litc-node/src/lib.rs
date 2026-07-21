@@ -1088,12 +1088,27 @@ pub fn run(args: Vec<String>) {
     // Known addresses for bootstrap + gossip (seeds, CLI, config, learned).
     let known: AddrSet = Arc::new(Mutex::new(HashSet::new()));
     known.lock().unwrap().insert(listen);
-    for s in cfg.seeds.iter().chain(connects.iter()) {
+    // Resolve all seed/connect hostnames *once* so that DNS round-robin or
+    // IPv4/IPv6 ordering differences can't produce two different addresses
+    // for the same hostname (which would bypass the connecting-set guard).
+    let mut connect_targets: Vec<SocketAddr> = Vec::new();
+    for s in cfg.seeds.iter() {
         if let Ok(addr) = s.parse::<SocketAddr>() {
             known.lock().unwrap().insert(addr);
         } else if let Ok(mut addrs) = s.to_socket_addrs() {
             if let Some(addr) = addrs.next() {
                 known.lock().unwrap().insert(addr);
+            }
+        }
+    }
+    for s in connects.iter() {
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            known.lock().unwrap().insert(addr);
+            connect_targets.push(addr);
+        } else if let Ok(mut addrs) = s.to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                known.lock().unwrap().insert(addr);
+                connect_targets.push(addr);
             }
         }
     }
@@ -1124,25 +1139,10 @@ pub fn run(args: Vec<String>) {
         }
     });
 
-    for c in connects {
+    for addr in connect_targets {
         let p = peers.clone();
         let nd = node.clone();
         let kn = known.clone();
-        // Resolve hostname → IP (connects only the first address to avoid
-        // duplicate connections when a name resolves to both IPv4 and IPv6).
-        let addr = match c.to_socket_addrs() {
-            Ok(mut a) => match a.next() {
-                Some(a) => a,
-                None => {
-                    eprintln!("cannot resolve {c}: no addresses");
-                    continue;
-                }
-            },
-            Err(e) => {
-                eprintln!("cannot resolve {c}: {e}");
-                continue;
-            }
-        };
         connect_to(addr, p, nd, kn, listen, &connecting);
     }
 
