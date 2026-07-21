@@ -1,15 +1,14 @@
-//! LiTC validation: transactions, one-time WOTS+ spends, and blocks.
+//! LiTC validation: transactions and blocks.
 //!
-//! A LiTC output's `script_pubkey` is simply the 20-byte commitment
-//! `HASH160(R)` of the owner's WOTS+ public root `R`. Spending witnesses a
-//! `WotsSignature` in the input's `script_sig`. Validation:
+//! A LiTC output's `script_pubkey` is the 20-byte commitment
+//! `HASH160(pk)` of the owner's ML-DSA-2 public key. Spending witnesses the
+//! full public key + signature in the input's `script_sig`. Validation:
 //!   1. the referenced UTXO exists (rejects double spends, incl. intra-block),
-//!   2. the WOTS+ signature verifies against the transaction sighash and the
-//!      committed `HASH160(R)`,
-//!   3. the commitment has not been spent before (WOTS+ one-time use).
+//!   2. the ML-DSA-2 signature verifies against the transaction sighash and the
+//!      committed `HASH160(pk)`.
 
 use litc_primitives::{
-    sha256d, to_bytes, wots, Amount, Block, BlockHeader, Hash32, OutPoint, SignatureScheme,
+    sha256d, to_bytes, hash160, mldsa, Amount, Block, BlockHeader, Hash32, OutPoint, SignatureScheme,
     Transaction, TxIn, TxOut,
 };
 use litc_primitives::chainparams::ChainParams;
@@ -63,7 +62,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// The message a WOTS+ signature covers. The signed input's `script_sig` is
+/// The message a signature covers. The signed input's `script_sig` is
 /// replaced by its prevout `script_pubkey` (so the signature commits to the
 /// prevout, not to itself); other inputs are zeroed. Then SHA-256d.
 pub fn sighash(tx: &Transaction, input_index: usize, prev_script: &[u8]) -> [u8; 32] {
@@ -81,9 +80,8 @@ pub fn sighash(tx: &Transaction, input_index: usize, prev_script: &[u8]) -> [u8;
 /// Pure validation of a single *non-coinbase* transaction. Verifies, against
 /// the current UTXO set:
 ///   1. every referenced UTXO exists (rejects double spends),
-///   2. the WOTS+ signature verifies against the sighash and `HASH160(R)`,
-///   3. the commitment has not been spent before (WOTS+ one-time use),
-///   4. `sum(outputs) <= sum(inputs)` (no value creation / inflation).
+///   2. the ML-DSA-2 signature verifies against the sighash and `HASH160(pk)`,
+///   3. `sum(outputs) <= sum(inputs)` (no value creation / inflation).
 ///
 /// This function has **no side effects**: it never spends UTXOs or burns keys.
 /// Application happens separately in `apply_tx`, only after the whole block
@@ -107,12 +105,9 @@ pub fn validate_tx<S: StateStore>(
             .get_utxo(&inp.prevout)
             .ok_or_else(|| "input not found or already spent".to_string())?;
         if prev.output.script_pubkey.len() != 20 {
-            return Err("bad script_pubkey: need 20-byte HASH160(R)".into());
+            return Err("bad script_pubkey: need 20-byte HASH160(pk)".into());
         }
         let commit: [u8; 20] = prev.output.script_pubkey[..20].try_into().unwrap();
-        if store.get_burnt(&commit) {
-            return Err("address already spent (WOTS+ one-time)".into());
-        }
         // Coinbase maturity: a coinbase output may only be spent after
         // `COINBASE_MATURITY` blocks have been mined on top of its block.
         if let Some(h) = prev.coinbase_height {
@@ -122,11 +117,19 @@ pub fn validate_tx<S: StateStore>(
         }
         let msg = sighash(tx, idx, &prev.output.script_pubkey);
         match inp.scheme {
-            SignatureScheme::Wots256 => {
-                let witness = wots::decode_witness(&inp.script_sig)
-                    .map_err(|_| "cannot decode WOTS+ witness".to_string())?;
-                if !witness.verify(&msg, &commit) {
-                    return Err("WOTS+ signature invalid".into());
+            SignatureScheme::Mldsa2 => {
+                // script_sig = pk (1312 bytes) || sig (2420 bytes)
+                if inp.script_sig.len() != mldsa::PK_LEN + mldsa::SIG_LEN {
+                    return Err("bad ML-DSA-2 witness length".into());
+                }
+                let mut pk = [0u8; mldsa::PK_LEN];
+                pk.copy_from_slice(&inp.script_sig[..mldsa::PK_LEN]);
+                if hash160(&pk) != commit {
+                    return Err("ML-DSA-2 public key does not match commitment".into());
+                }
+                let sig_bytes = &inp.script_sig[mldsa::PK_LEN..];
+                if !mldsa::MlDsaKeypair::verify(&pk, &msg, sig_bytes) {
+                    return Err("ML-DSA-2 signature invalid".into());
                 }
             }
             SignatureScheme::Unknown => {
@@ -257,10 +260,9 @@ pub fn validate_block_value<S: StateStore>(
     Ok(())
 }
 
-/// Apply a *validated* transaction to the store, spending its inputs and
-/// burning the spent keys. Callers must have already passed `validate_tx`
-/// (which guarantees every input exists and is unburnt), so this cannot fail
-/// under normal conditions.
+/// Apply a *validated* transaction to the store, spending its inputs.
+/// Callers must have already passed `validate_tx` (which guarantees every
+/// input exists), so this cannot fail under normal conditions.
 fn apply_tx<S: StateStore>(
     tx: &Transaction,
     store: &mut S,
@@ -268,16 +270,7 @@ fn apply_tx<S: StateStore>(
     is_coinbase: bool,
 ) -> Result<(), String> {
     for inp in &tx.inputs {
-        let prev = store
-            .get_utxo(&inp.prevout)
-            .ok_or_else(|| "input not found or already spent".to_string())?
-            .clone();
-        if prev.output.script_pubkey.len() != 20 {
-            return Err("bad script_pubkey: need 20-byte HASH160(R)".into());
-        }
-        let commit: [u8; 20] = prev.output.script_pubkey[..20].try_into().unwrap();
         store.remove_utxo(&inp.prevout);
-        store.mark_burnt(commit);
     }
     for (i, out) in tx.outputs.iter().enumerate() {
         let op = OutPoint {
@@ -290,12 +283,6 @@ fn apply_tx<S: StateStore>(
                 output: TxOut {
                     value: out.value,
                     script_pubkey: out.script_pubkey.clone(),
-                    // The KEM ciphertext is carried at the transaction level
-                    // (`tx.ephemeral`) and shared by all of the transaction's
-                    // outputs. Store it on each UTXO so the recipient can scan
-                    // and recover the one-time WOTS+ key (and so it is included
-                    // in the committed `state_root`).
-                    ephemeral: tx.ephemeral.clone(),
                 },
                 coinbase_height: if is_coinbase { Some(height) } else { None },
             },
@@ -503,7 +490,7 @@ fn hex(b: &[u8]) -> String {
 // Helpers for building transactions (used by wallet/miner and tests)
 // ---------------------------------------------------------------------------
 
-/// A coinbase with a single output to `commit` (20-byte HASH160(R)).
+/// A coinbase with a single output to `commit` (20-byte HASH160(pk)).
 pub fn coinbase(commit: [u8; 20], value: Amount, height: u64) -> (Block, OutPoint) {
     let tx = Transaction {
         version: 1,
@@ -511,9 +498,7 @@ pub fn coinbase(commit: [u8; 20], value: Amount, height: u64) -> (Block, OutPoin
         outputs: vec![TxOut {
             value,
             script_pubkey: commit.to_vec(),
-            ephemeral: vec![],
         }],
-        ephemeral: vec![],
         lock_time: 0,
     };
     let op = OutPoint {
@@ -539,7 +524,7 @@ pub fn coinbase(commit: [u8; 20], value: Amount, height: u64) -> (Block, OutPoin
 
 /// Build a signed spend of `prev` (owned by `kp`) paying `value` to `to_commit`.
 pub fn spend(
-    kp: &wots::WotsKeypair,
+    kp: &mldsa::MlDsaKeypair,
     prev: OutPoint,
     prev_script: &[u8],
     value: Amount,
@@ -549,20 +534,23 @@ pub fn spend(
         version: 1,
         inputs: vec![TxIn {
             prevout: prev,
-            scheme: SignatureScheme::Wots256,
+            scheme: SignatureScheme::Mldsa2,
             script_sig: vec![],
             sequence: 0xFFFF_FFFF,
         }],
         outputs: vec![TxOut {
             value,
             script_pubkey: to_commit.to_vec(),
-            ephemeral: vec![],
         }],
-        ephemeral: vec![],
         lock_time: 0,
     };
     let msg = sighash(&tx, 0, prev_script);
-    tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
+    let pk = kp.public_key_bytes();
+    let sig = kp.sign(&msg);
+    let mut script_sig = Vec::with_capacity(mldsa::PK_LEN + mldsa::SIG_LEN);
+    script_sig.extend_from_slice(&pk);
+    script_sig.extend_from_slice(&sig);
+    tx.inputs[0].script_sig = script_sig;
     tx
 }
 
@@ -583,9 +571,7 @@ mod tests {
             outputs: vec![TxOut {
                 value,
                 script_pubkey: commit.to_vec(),
-                ephemeral: vec![],
             }],
-            ephemeral: vec![],
             lock_time: 0,
         }
     }
@@ -653,7 +639,7 @@ mod tests {
         assert!(!store.is_applied(&a2.block_hash()));
         // UTXO set reflects chain B: g + b1 + b2 + b3 = 4 coinbases.
         assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), 4);
-        let bal: u64 = litc_store::UtxoStore::iter_utxos(&store).iter().map(|(_, o, _)| o.value.0).sum();
+        let bal: u64 = litc_store::UtxoStore::iter_utxos(&store).iter().map(|(_, o)| o.value.0).sum();
         assert_eq!(bal, 4 * 5 * 100_000_000);
 
         // A weaker fork must NOT trigger a reorg.
@@ -705,8 +691,8 @@ mod tests {
 
     #[test]
     fn coinbase_then_spend_ok() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         apply_block(&mut store, &blk).unwrap();
@@ -714,25 +700,24 @@ mod tests {
         // Mature the genesis coinbase (created at height 0).
         let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
 
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, COINBASE_MATURITY + 1, vec![tx]);
         apply_block(&mut store, &spend_block).unwrap();
-        assert!(store.burnt().is_burnt(&commit));
     }
 
     #[test]
     fn coinbase_immature_spend_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         apply_block(&mut store, &blk).unwrap();
         // Spend at height 1: the genesis coinbase (height 0) is not mature.
         let tip = extend(&mut store, blk.block_hash(), 1);
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, 2, vec![tx]);
         // `apply_block` validates the block, which rejects the immature spend.
@@ -740,84 +725,31 @@ mod tests {
     }
 
     #[test]
-    fn one_time_reuse_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
-        let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
-        let mut store = MemoryStore::new();
-        apply_block(&mut store, &blk).unwrap();
-
-        // Mature the genesis coinbase before spending it.
-        let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
-        // First spend of the address (burns `commit`).
-        let first = spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
-        apply_block(
-            &mut store,
-            &block(tip, COINBASE_MATURITY + 1, vec![first]),
-        )
-        .unwrap();
-        assert!(store.burnt().is_burnt(&commit));
-
-        // In a fresh store, spend the same address once, then try to spend a
-        // second UTXO at the same commitment with the same key.
-        let mut store2 = MemoryStore::new();
-        apply_block(&mut store2, &blk).unwrap();
-        let tip2 = extend(&mut store2, blk.block_hash(), COINBASE_MATURITY);
-        let first2 = spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
-        apply_block(
-            &mut store2,
-            &block(tip2, COINBASE_MATURITY + 1, vec![first2]),
-        )
-        .unwrap();
-
-        store2.add_utxo(
-            OutPoint {
-                txid: Hash32([9u8; 32]),
-                index: 0,
-            },
-            TxOut {
-                value: Amount(5 * 100_000_000),
-                script_pubkey: commit.to_vec(),
-                ephemeral: vec![],
-            },
-            vec![],
-        );
-        let bad_tx = spend(
-            &kp,
-            OutPoint {
-                txid: Hash32([9u8; 32]),
-                index: 0,
-            },
-            &commit,
-            Amount(4 * 100_000_000),
-            to,
-        );
-        assert!(validate_tx(&bad_tx, &store2, 1_000_000).is_err());
-    }
-
-    #[test]
     fn bad_signature_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
-        let rogue = wots::WotsKeypair::derive(&[0x99u8; 32], 0);
-        let to = rogue.pubkey_root_hash160();
+        let rogue = mldsa::MlDsaKeypair::derive(&[0x99u8; 32], 0);
+        let to = rogue.pubkey_hash160();
         let mut tx = spend(&rogue, op, &commit, Amount(4 * 100_000_000), to);
         let msg = sighash(&tx, 0, &commit);
-        tx.inputs[0].script_sig = wots::encode_witness(&rogue.sign(&msg));
+        let pk = rogue.public_key_bytes();
+        let sig = rogue.sign(&msg);
+        let mut script_sig = Vec::with_capacity(mldsa::PK_LEN + mldsa::SIG_LEN);
+        script_sig.extend_from_slice(&pk);
+        script_sig.extend_from_slice(&sig);
+        tx.inputs[0].script_sig = script_sig;
         let b = block(blk.block_hash(), 1, vec![tx]);
         assert!(connect_block(&b, &mut store, &EASY).is_err());
     }
 
     #[test]
     fn merkle_mismatch_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (mut blk, _) = coinbase(commit, Amount(5 * 100_000_000), 0);
         blk.header.merkle_root = Hash32([7u8; 32]); // wrong
         let mut store = MemoryStore::new();
@@ -830,16 +762,16 @@ mod tests {
     /// verify a block without the full history.
     #[test]
     fn state_root_enforced() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
         // Mature the genesis coinbase, then build a legitimate spend.
         let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let b = block(tip, COINBASE_MATURITY + 1, vec![tx]);
 
@@ -887,8 +819,8 @@ mod tests {
     #[test]
     fn reserved_signature_scheme_rejected() {
         let mut store = MemoryStore::new();
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let op = OutPoint {
             txid: Hash32([1u8; 32]),
             index: 0,
@@ -898,9 +830,7 @@ mod tests {
             TxOut {
                 value: Amount(5 * 100_000_000),
                 script_pubkey: commit.to_vec(),
-                ephemeral: vec![],
             },
-            vec![],
         );
         let make_tx = |scheme: SignatureScheme| -> Transaction {
             let mut tx = Transaction {
@@ -914,27 +844,28 @@ mod tests {
                 outputs: vec![TxOut {
                     value: Amount(1),
                     script_pubkey: vec![0u8; 20],
-                    ephemeral: vec![],
                 }],
-                ephemeral: vec![],
                 lock_time: 0,
             };
-            // Sign over the sighash that *includes* the scheme byte, so a
-            // Wots256 tx verifies while the others are rejected by dispatch.
             let msg = sighash(&tx, 0, &commit);
-            tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
+            let pk = kp.public_key_bytes();
+            let sig = kp.sign(&msg);
+            let mut script_sig = Vec::with_capacity(mldsa::PK_LEN + mldsa::SIG_LEN);
+            script_sig.extend_from_slice(&pk);
+            script_sig.extend_from_slice(&sig);
+            tx.inputs[0].script_sig = script_sig;
             tx
         };
         assert!(validate_tx(&make_tx(SignatureScheme::Reserved1), &store, 1).is_err());
         assert!(validate_tx(&make_tx(SignatureScheme::Unknown), &store, 1).is_err());
-        assert!(validate_tx(&make_tx(SignatureScheme::Wots256), &store, 1).is_ok());
+        assert!(validate_tx(&make_tx(SignatureScheme::Mldsa2), &store, 1).is_ok());
     }
 
     /// Helper: a signed spend of `prev` paying `value` to `to`, with a valid
-    /// WOTS+ signature but an arbitrary output value (so inflation tests can
+    /// ML-DSA-2 signature but an arbitrary output value (so inflation tests can
     /// over-pay).
     fn signed_spend(
-        kp: &wots::WotsKeypair,
+        kp: &mldsa::MlDsaKeypair,
         prev: OutPoint,
         prev_commit: &[u8; 20],
         value: Amount,
@@ -944,20 +875,23 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prevout: prev,
-                scheme: SignatureScheme::Wots256,
+                scheme: SignatureScheme::Mldsa2,
                 script_sig: vec![],
                 sequence: 0xFFFF_FFFF,
             }],
             outputs: vec![TxOut {
                 value,
                 script_pubkey: to.to_vec(),
-                ephemeral: vec![],
             }],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let msg = sighash(&tx, 0, prev_commit);
-        tx.inputs[0].script_sig = wots::encode_witness(&kp.sign(&msg));
+        let pk = kp.public_key_bytes();
+        let sig = kp.sign(&msg);
+        let mut script_sig = Vec::with_capacity(mldsa::PK_LEN + mldsa::SIG_LEN);
+        script_sig.extend_from_slice(&pk);
+        script_sig.extend_from_slice(&sig);
+        tx.inputs[0].script_sig = script_sig;
         tx
     }
 
@@ -965,14 +899,14 @@ mod tests {
     /// (no value creation / infinite inflation).
     #[test]
     fn inflation_via_outputs_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         // Pay out 51 LIT while only owning 5 LIT.
         let tx = signed_spend(&kp, op.clone(), &commit, Amount(51 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![tx]);
@@ -1005,15 +939,15 @@ mod tests {
     /// the tip stays where it was.
     #[test]
     fn partial_apply_rolls_back() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
         let before = litc_store::UtxoStore::iter_utxos(&store).len();
 
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         // Tx 0: valid spend of `op` (would consume it on apply).
         let good = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         // Tx 1: a coinbase that is not first -> rejected at block validation.
@@ -1023,9 +957,7 @@ mod tests {
             outputs: vec![TxOut {
                 value: Amount(999),
                 script_pubkey: to.to_vec(),
-                ephemeral: vec![],
             }],
-            ephemeral: vec![],
             lock_time: 0,
         };
         let b = block(blk.block_hash(), 1, vec![good, bad]);
@@ -1041,14 +973,14 @@ mod tests {
     /// double spend and must be rejected.
     #[test]
     fn intra_block_double_spend_rejected() {
-        let kp = wots::WotsKeypair::derive(&[0x12u8; 32], 0);
-        let commit = kp.pubkey_root_hash160();
+        let kp = mldsa::MlDsaKeypair::derive(&[0x12u8; 32], 0);
+        let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
         connect_block(&blk, &mut store, &EASY).unwrap();
 
-        let kp2 = wots::WotsKeypair::derive(&[0x34u8; 32], 0);
-        let to = kp2.pubkey_root_hash160();
+        let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
+        let to = kp2.pubkey_hash160();
         let a = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         let b_tx = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![a, b_tx]);

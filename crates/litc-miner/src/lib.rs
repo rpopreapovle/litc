@@ -16,10 +16,8 @@ pub struct BlockTemplate {
     pub epoch_seed: Hash32,
     /// Coinbase value (block subsidy + fees).
     pub coinbase_value: Amount,
-    /// ScriptPubKey for the coinbase output (payment to miner's stealth address).
+    /// ScriptPubKey for the coinbase output (payment to miner's address).
     pub coinbase_script: Vec<u8>,
-    /// KEM ciphertext for the coinbase stealth output (tx-level ephemeral).
-    pub coinbase_ephemeral: Vec<u8>,
     /// Non-coinbase transactions to include.
     pub txs: Vec<Transaction>,
     /// Root committing to the live consensus state after this block is applied
@@ -46,9 +44,7 @@ impl MinerBackend for CpuMiner {
             outputs: vec![TxOut {
                 value: t.coinbase_value,
                 script_pubkey: t.coinbase_script.clone(),
-                ephemeral: vec![],
             }],
-            ephemeral: t.coinbase_ephemeral.clone(),
             lock_time: 0,
         };
         let mut txs = vec![coinbase];
@@ -100,9 +96,7 @@ pub fn assemble_block(t: &BlockTemplate) -> Block {
         outputs: vec![TxOut {
             value: t.coinbase_value,
             script_pubkey: t.coinbase_script.clone(),
-            ephemeral: vec![],
         }],
-        ephemeral: t.coinbase_ephemeral.clone(),
         lock_time: 0,
     };
     let mut txs = vec![coinbase];
@@ -137,7 +131,6 @@ mod tests {
             epoch_seed: Hash32([2u8; 32]),
             coinbase_value: Amount(5 * 100_000_000),
             coinbase_script: vec![0xaa; 20],
-            coinbase_ephemeral: vec![],
             txs: vec![],
             state_root: Hash32([0u8; 32]),
         };
