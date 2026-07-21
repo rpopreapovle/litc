@@ -577,6 +577,10 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
     connecting: &AddrSet,
 ) {
     {
+        // Don't connect to ourselves.
+        if addr == listen {
+            return;
+        }
         let p = peers.lock().unwrap();
         if p.contains_key(&addr) {
             eprintln!("[p2p] connect_to skip {addr} (already in peers)");
