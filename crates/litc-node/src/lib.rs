@@ -125,6 +125,8 @@ const PEER_TX_WINDOW: u64 = 60;
 const PEER_TX_LIMIT: usize = 200;
 const PEER_BLOCK_WINDOW: u64 = 60;
 const PEER_BLOCK_LIMIT: usize = 200;
+/// Maximum entries in known_blocks/known_txs before eviction.
+const KNOWN_MAX: usize = 50_000;
 /// Sentinel "peer" for locally-originated traffic (miner output, the mempool
 /// directory), which is trusted and not rate-limited in the same way.
 const LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
@@ -389,6 +391,9 @@ impl<S: SpendStore + StateStore> Node<S> {
         self.store.set_work(hash, work);
         // Reorganise to the heaviest chain (may apply/rollback blocks).
         self.reorg();
+        if self.known_blocks.len() >= KNOWN_MAX {
+            self.known_blocks.clear();
+        }
         self.known_blocks.insert(hash);
         self.tip = self.store.tip().unwrap_or(Hash32([0u8; 32]));
         self.sync_chain();
@@ -504,6 +509,9 @@ impl<S: SpendStore + StateStore> Node<S> {
             return false;
         }
         peer_rate_record(&mut self.peer_tx, &from);
+        if self.known_txs.len() >= KNOWN_MAX {
+            self.known_txs.clear();
+        }
         self.known_txs.insert(id);
         self.mempool.push(tx);
         true
