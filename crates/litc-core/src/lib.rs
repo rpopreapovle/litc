@@ -209,7 +209,11 @@ pub fn validate_checkpoint(block: &Block, params: &ChainParams) -> Result<(), St
 ///   - no intra-block double spend,
 ///   - `sum(outputs) <= sum(inputs)` for every spend (delegated to `validate_tx`),
 ///   - coinbase value `<= block_subsidy(height) + total_fees`.
-pub fn validate_block_value<S: StateStore>(block: &Block, store: &S) -> Result<(), String> {
+pub fn validate_block_value<S: StateStore>(
+    block: &Block,
+    store: &S,
+    halving_interval: u64,
+) -> Result<(), String> {
     let mut spent_in_block: HashSet<OutPoint> = HashSet::new();
     let mut sum_fees: u64 = 0;
     let mut seen_coinbase = false;
@@ -242,7 +246,7 @@ pub fn validate_block_value<S: StateStore>(block: &Block, store: &S) -> Result<(
     if let Some(cb) = block.txs.first() {
         if cb.inputs.is_empty() {
             let out: u64 = cb.outputs.iter().map(|o| o.value.0).sum();
-            let max_allowed = block_subsidy(block.header.height)
+            let max_allowed = block_subsidy_with(block.header.height, halving_interval)
                 .0
                 .checked_add(sum_fees)
                 .ok_or_else(|| "subsidy overflow".to_string())?;
@@ -309,11 +313,12 @@ pub fn connect_block<S: SpendStore + StateStore>(
     block: &Block,
     store: &mut S,
     target: &[u8; 32],
+    halving_interval: u64,
 ) -> Result<(), String> {
     if !validate_block_pow_merkle(block, target) {
         return Err("proof-of-work / merkle invalid".into());
     }
-    apply_block(store, block)?;
+    apply_block(store, block, halving_interval)?;
     store.set_tip(block.block_hash(), block.header.height);
     Ok(())
 }
@@ -336,11 +341,15 @@ pub fn validate_block_pow_merkle(block: &Block, target: &[u8; 32]) -> bool {
 /// `UndoData` is never even created. Does not check PoW (callers validate PoW
 /// once, at first sight, via `remember_pow`) and does not set the tip — chain
 /// selection is the node's job.
-pub fn apply_block<S: SpendStore + StateStore>(store: &mut S, block: &Block) -> Result<(), String> {
+pub fn apply_block<S: SpendStore + StateStore>(
+    store: &mut S,
+    block: &Block,
+    halving_interval: u64,
+) -> Result<(), String> {
     // Pure validation first — no side effects, so a rejected block cannot
     // partially corrupt the UTXO set.
     validate_block_header(block, store)?;
-    validate_block_value(block, store)?;
+    validate_block_value(block, store, halving_interval)?;
 
     // State-root check (read-only via an overlay; the base is left untouched on
     // a mismatch, so no rollback is needed). A zero `state_root` means "not set"
@@ -427,7 +436,7 @@ pub fn path_to<S: SpendStore>(
 /// Rolls back the current tip to the common ancestor, then connects the new
 /// branch. UTXO changes are reversed via each block's `UndoData`. The caller
 /// is responsible for having validated PoW and recorded each block's `work`.
-pub fn reorganize<S: SpendStore + StateStore>(store: &mut S) {
+pub fn reorganize<S: SpendStore + StateStore>(store: &mut S, halving_interval: u64) {
     let new_tip = match store.best_tip_by_work() {
         Some(h) => h,
         None => return,
@@ -436,7 +445,7 @@ pub fn reorganize<S: SpendStore + StateStore>(store: &mut S) {
         Some(h) => h,
         None => {
             // Nothing applied yet: just connect the best chain from genesis.
-            connect_branch(store, new_tip, None);
+            connect_branch(store, new_tip, None, halving_interval);
             return;
         }
     };
@@ -453,7 +462,7 @@ pub fn reorganize<S: SpendStore + StateStore>(store: &mut S) {
             None => break,
         };
     }
-    connect_branch(store, new_tip, ancestor);
+    connect_branch(store, new_tip, ancestor, halving_interval);
 }
 
 /// Connect every block on the path from `ancestor`'s child up to `tip`.
@@ -461,11 +470,12 @@ fn connect_branch<S: SpendStore + StateStore>(
     store: &mut S,
     tip: Hash32,
     ancestor: Option<Hash32>,
+    halving_interval: u64,
 ) {
     for bhash in path_to(store, tip, ancestor) {
         if !store.is_applied(&bhash) {
             if let Some(block) = store.get_block(&bhash) {
-                if let Err(e) = apply_block(store, &block) {
+                if let Err(e) = apply_block(store, &block, halving_interval) {
                     eprintln!("reorg: cannot apply {}: {e}", hex(&bhash.0[..4]));
                     // Abort: the tip is only advanced once the *entire* branch
                     // has applied successfully, so the store never points at a
@@ -585,7 +595,12 @@ mod tests {
         let (g, _) = coinbase([1u8; 20], Amount(5 * 100_000_000), 0);
         store.put_block(&g).unwrap();
         store.set_work(g.block_hash(), 10);
-        apply_block(&mut store, &g).unwrap();
+        apply_block(
+            &mut store,
+            &g,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
         store.mark_applied(g.block_hash());
         store.set_tip(g.block_hash(), 0);
 
@@ -602,7 +617,12 @@ mod tests {
         );
         for b in [&a1, &a2] {
             store.put_block(b).unwrap();
-            apply_block(&mut store, b).unwrap();
+            apply_block(
+                &mut store,
+                b,
+                litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+            )
+            .unwrap();
             store.mark_applied(b.block_hash());
             store.set_work(b.block_hash(), 10 * (b.header.height as u128));
         }
@@ -631,7 +651,10 @@ mod tests {
         }
 
         // Heaviest chain wins.
-        reorganize(&mut store);
+        reorganize(
+            &mut store,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        );
         assert_eq!(store.tip(), Some(b3.block_hash()));
         assert!(store.is_applied(&b3.block_hash()));
         assert!(!store.is_applied(&a2.block_hash()));
@@ -651,7 +674,10 @@ mod tests {
         );
         store.put_block(&c1).unwrap();
         store.set_work(c1.block_hash(), 1); // tiny work
-        reorganize(&mut store);
+        reorganize(
+            &mut store,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        );
         assert_eq!(store.tip(), Some(b3.block_hash()));
     }
 
@@ -680,7 +706,12 @@ mod tests {
     fn extend(store: &mut MemoryStore, mut prev: Hash32, n: u64) -> Hash32 {
         for h in 1..=n {
             let b = block(prev, h, vec![cb([h as u8; 20], Amount(5 * 100_000_000))]);
-            apply_block(store, &b).unwrap();
+            apply_block(
+                store,
+                &b,
+                litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+            )
+            .unwrap();
             prev = b.block_hash();
         }
         prev
@@ -692,7 +723,12 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        apply_block(&mut store, &blk).unwrap();
+        apply_block(
+            &mut store,
+            &blk,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
 
         // Mature the genesis coinbase (created at height 0).
         let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
@@ -701,7 +737,12 @@ mod tests {
         let to = kp2.pubkey_hash160();
         let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, COINBASE_MATURITY + 1, vec![tx]);
-        apply_block(&mut store, &spend_block).unwrap();
+        apply_block(
+            &mut store,
+            &spend_block,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -710,7 +751,12 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        apply_block(&mut store, &blk).unwrap();
+        apply_block(
+            &mut store,
+            &blk,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
         // Spend at height 1: the genesis coinbase (height 0) is not mature.
         let tip = extend(&mut store, blk.block_hash(), 1);
         let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
@@ -718,7 +764,12 @@ mod tests {
         let tx = spend(&kp, op, &commit, Amount(4 * 100_000_000), to);
         let spend_block = block(tip, 2, vec![tx]);
         // `apply_block` validates the block, which rejects the immature spend.
-        assert!(apply_block(&mut store, &spend_block).is_err());
+        assert!(apply_block(
+            &mut store,
+            &spend_block,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     #[test]
@@ -727,7 +778,13 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
 
         let rogue = mldsa::MlDsaKeypair::derive(&[0x99u8; 32], 0);
         let to = rogue.pubkey_hash160();
@@ -740,7 +797,13 @@ mod tests {
         script_sig.extend_from_slice(&sig);
         tx.inputs[0].script_sig = script_sig;
         let b = block(blk.block_hash(), 1, vec![tx]);
-        assert!(connect_block(&b, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &b,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     #[test]
@@ -750,7 +813,13 @@ mod tests {
         let (mut blk, _) = coinbase(commit, Amount(5 * 100_000_000), 0);
         blk.header.merkle_root = Hash32([7u8; 32]); // wrong
         let mut store = MemoryStore::new();
-        assert!(connect_block(&blk, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     /// CRITICAL FIX #5 (StateRoot): a block whose `state_root` does not match the
@@ -763,7 +832,13 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
 
         // Mature the genesis coinbase, then build a legitimate spend.
         let tip = extend(&mut store, blk.block_hash(), COINBASE_MATURITY);
@@ -778,11 +853,23 @@ mod tests {
 
         let mut good = b.clone();
         good.header.state_root = Hash32(root);
-        assert!(connect_block(&good, &mut store, &EASY).is_ok());
+        assert!(connect_block(
+            &good,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_ok());
 
         let mut bad = b.clone();
         bad.header.state_root = Hash32([0xABu8; 32]); // wrong, non-zero
-        assert!(connect_block(&bad, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &bad,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     /// CRITICAL FIX #6 (checkpoints): a block at a checkpoint height must carry
@@ -900,14 +987,26 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
 
         let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_hash160();
         // Pay out 51 LIT while only owning 5 LIT.
         let tx = signed_spend(&kp, op.clone(), &commit, Amount(51 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![tx]);
-        assert!(connect_block(&b, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &b,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     /// CRITICAL FIX #1: a coinbase may mint at most block_subsidy(height) (+ fees). Minting
@@ -916,7 +1015,13 @@ mod tests {
     fn inflated_coinbase_rejected() {
         let (blk, _) = coinbase([1u8; 20], Amount(60 * 100_000_000), 0); // > SUBSIDY
         let mut store = MemoryStore::new();
-        assert!(connect_block(&blk, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     /// A block may contain exactly one coinbase, and it must be first.
@@ -924,11 +1029,23 @@ mod tests {
     fn two_coinbases_rejected() {
         let (g, _) = coinbase([0u8; 20], Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&g, &mut store, &EASY).unwrap();
+        connect_block(
+            &g,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
         let cb1 = cb([1u8; 20], Amount(5 * 100_000_000));
         let cb2 = cb([2u8; 20], Amount(5 * 100_000_000));
         let b = block(g.block_hash(), 1, vec![cb1, cb2]);
-        assert!(connect_block(&b, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &b,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 
     /// CRITICAL FIX #2: an invalid transaction in a block must not partially
@@ -940,7 +1057,13 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
         let before = litc_store::UtxoStore::iter_utxos(&store).len();
 
         let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
@@ -958,7 +1081,13 @@ mod tests {
             lock_time: 0,
         };
         let b = block(blk.block_hash(), 1, vec![good, bad]);
-        assert!(connect_block(&b, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &b,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
 
         // Nothing changed: `op` still unspent, count and tip unchanged.
         assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), before);
@@ -974,13 +1103,25 @@ mod tests {
         let commit = kp.pubkey_hash160();
         let (blk, op) = coinbase(commit, Amount(5 * 100_000_000), 0);
         let mut store = MemoryStore::new();
-        connect_block(&blk, &mut store, &EASY).unwrap();
+        connect_block(
+            &blk,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
 
         let kp2 = mldsa::MlDsaKeypair::derive(&[0x34u8; 32], 0);
         let to = kp2.pubkey_hash160();
         let a = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         let b_tx = signed_spend(&kp, op.clone(), &commit, Amount(4 * 100_000_000), to);
         let b = block(blk.block_hash(), 1, vec![a, b_tx]);
-        assert!(connect_block(&b, &mut store, &EASY).is_err());
+        assert!(connect_block(
+            &b,
+            &mut store,
+            &EASY,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval
+        )
+        .is_err());
     }
 }

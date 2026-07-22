@@ -193,7 +193,12 @@ mod tests {
     }
 
     fn apply_block_raw(store: &mut MemoryStore, b: &Block) {
-        apply_block(store, b).unwrap();
+        apply_block(
+            store,
+            b,
+            litc_primitives::chainparams::ChainParams::testnet().halving_interval,
+        )
+        .unwrap();
         store.set_tip(b.block_hash(), b.header.height);
     }
 

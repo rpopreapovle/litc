@@ -427,7 +427,7 @@ impl<S: SpendStore + StateStore> Node<S> {
     /// Rolls back the current tip to the common ancestor, then connects the
     /// new branch. UTXO changes are reversed via each block's `UndoData`.
     fn reorg(&mut self) {
-        reorganize(&mut self.store);
+        reorganize(&mut self.store, self.params.halving_interval);
     }
 
     /// Rebuild the best-chain index (`self.chain`) from the current tip, so
