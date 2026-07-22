@@ -146,16 +146,21 @@ fn cmd_wallet(args: &[String]) {
         "balance" => {
             let (w, _ks) = open_wallet();
             let store = open_store();
+            // Build a set of wallet commitments (O(A)) for O(1) lookup.
+            let mut commits = std::collections::HashSet::new();
+            for idx in 0..=200u32 {
+                commits.insert(w.commitment_at(idx));
+            }
             let utxos = store.iter_utxos();
             let mut sum: u64 = 0;
             let mut count = 0u64;
             for (_op, out) in &utxos {
-                for idx in 0..=200u32 {
-                    let commit = w.commitment_at(idx);
-                    if out.script_pubkey.len() >= 20 && &out.script_pubkey[..20] == commit {
+                if out.script_pubkey.len() >= 20 {
+                    let mut prefix = [0u8; 20];
+                    prefix.copy_from_slice(&out.script_pubkey[..20]);
+                    if commits.contains(&prefix) {
                         sum += out.value.0;
                         count += 1;
-                        break;
                     }
                 }
             }
@@ -165,39 +170,24 @@ fn cmd_wallet(args: &[String]) {
         "history" => {
             let (w, _ks) = open_wallet();
             let store = open_store();
-            let mut idx = 0u32;
+            // Build commitment → index map for O(1) lookup.
+            let mut commit_to_idx = std::collections::HashMap::new();
+            for idx in 0..=200u32 {
+                commit_to_idx.insert(w.commitment_at(idx), idx);
+            }
+            let utxos = store.iter_utxos();
             let mut found_any = false;
-            loop {
-                let commit = w.commitment_at(idx);
-                if let Some(op) = store.find_by_commit(&commit) {
-                    if let Some(out) = store.utxo(&op) {
+            for (op, out) in &utxos {
+                if out.script_pubkey.len() >= 20 {
+                    let mut prefix = [0u8; 20];
+                    prefix.copy_from_slice(&out.script_pubkey[..20]);
+                    if let Some(&idx) = commit_to_idx.get(&prefix) {
                         println!("  {}  index={idx}  {}.{:08} LIT",
                             op.txid.to_hex(),
                             out.value.0 / COIN,
                             out.value.0 % COIN);
                         found_any = true;
                     }
-                    idx += 1;
-                } else {
-                    let mut found_more = false;
-                    for gap in 1..=20u32 {
-                        if let Some(op2) = store.find_by_commit(&w.commitment_at(idx + gap)) {
-                            if let Some(out2) = store.utxo(&op2) {
-                                println!("  {}  index={}  {}.{:08} LIT",
-                                    op2.txid.to_hex(),
-                                    idx + gap,
-                                    out2.value.0 / COIN,
-                                    out2.value.0 % COIN);
-                                found_any = true;
-                            }
-                            found_more = true;
-                        }
-                    }
-                    if found_more {
-                        idx += 1;
-                        continue;
-                    }
-                    break;
                 }
             }
             if !found_any {
