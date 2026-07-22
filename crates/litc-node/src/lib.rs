@@ -313,6 +313,7 @@ impl<S: SpendStore + StateStore> Node<S> {
             let candidate = assemble_block(&template);
             let root = block_state_root(&mut self.store, &candidate)
                 .expect("template should apply to current state");
+            eprintln!("[dbg] make_template: h={} computed_root={}", height, hex(&root[..4]));
             template.state_root = Hash32(root);
         }
         (template, target)
