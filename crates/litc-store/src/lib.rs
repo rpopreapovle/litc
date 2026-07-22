@@ -999,7 +999,7 @@ impl FileStore {
         if base.join("chain.dat").exists() {
             let mut f = File::open(base.join("chain.dat"))
                 .map_err(|e| format!("cannot open chain: {e}"))?;
-            for (_h, (off, _len, _hb)) in idx.iter() {
+            for (off, _len, _hb) in idx.values() {
                 let (_hh, _has_body, header, txs) = read_block_record(&mut f, *off)
                     .map_err(|e| format!("cannot read block: {e}"))?;
                 let block = Block { header, txs };
