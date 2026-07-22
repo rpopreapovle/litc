@@ -10,16 +10,8 @@ simplify LiTC or improve it for the ordinary user.
 alike. No second serializer, no JSON.
 
 ## Stage 2 — Primitives
-`litc-primitives`: SHA-256d, merkle, WOTS+ keys/sign, block & tx types.
+`litc-primitives`: SHA-256d, merkle, ML-DSA-2 keys/sign, block & tx types.
 Unit tests for each.
-
-**KEM wrapper (stealth addresses):** add a `kem` module on top of ML-KEM-512
-(RustCrypto `ml-kem`, FIPS 203 — post-quantum). Expose a small, dependency-light
-wrapper: `kem_keypair_from_seed(seed) -> (pk, sk)`, `kem_encaps(pk) ->
-(shared, ct)`, `kem_decaps(sk, ct) -> shared`. The KEM is used only to build
-reusable stealth addresses; it never signs. The decapsulation key is a 64-byte
-seed derived deterministically from the wallet master seed, so the wallet
-stays stateless (one master seed). See [stealth.md](stealth.md).
 
 ## Stage 3 — Storage traits
 `litc-store`: `BlockStore`, `ChainStore`, `UtxoStore` traits + `Memory*`
@@ -33,16 +25,10 @@ every 30 blocks), reorg, confirmation model (pending / 1 / 6).
 `litc-keystore` (`FileKeyStore`) + `litc-wallet` (balance, build/sign tx).
 Wallet holds no secrets.
 
-**Reusable stealth addresses:** `litc-wallet` derives an ML-KEM-512
-encapsulation key from the master seed and exposes `stealth_address()`.
-`send_stealth(recipient, value)` builds an output that locks a fresh one-time
-WOTS+ key and carries the KEM ciphertext in `TxOut.ephemeral`. `scan_chain()`
-walks every UTXO, decapsulates each `ephemeral` with the scan key, and recovers
-the WOTS+ spend key for outputs whose commitment matches — then persists those
-keys to the `KeyStore` (the `StealthKey` records) so owned outputs survive
-restarts. `spend_stealth()` signs a spend with the recovered key. A "for
-dummies" wallet just sees its balance rise; the address never changes. See
-[stealth.md](stealth.md).
+**ML-DSA-2 keys:** `litc-wallet` derives ML-DSA-2 keypairs from the master
+seed. Each address is a reusable, stateless post-quantum keypair. Sending
+uses ML-DSA-2 signatures (~2420 bytes); receiving uses bech32m addresses
+(~40 characters). No stealth scanning, no KEM, no burnt keys.
 
 ## Stage 6 — CPU miner
 `litc-miner`: `MinerBackend` trait + `CpuMiner`. Node mines abstractly.
@@ -91,16 +77,17 @@ any FFI-capable language). The reusable stealth-address scheme is documented in
 ## Session 2026-07-15 — consensus hardening (all DONE)
 
 The following were added on top of the MVP and are documented in
-[specification.md](specification.md), [state.md](state.md), and [wots.md](wots.md).
+[specification.md](specification.md) and [state.md](state.md).
 
 ### Stage 13 — Consensus state commitment (state_root + SMT)
-Block header carries `state_root = SHA-256d(utxo_root || burnt_root)`, where
-both roots are Sparse Merkle Trees. A bootstrapping node verifies the root by
-applying each block over a read-only overlay and recomputing it, so the PoW
-secures the resulting state, not just transitions. See [state.md](state.md).
+Block header carries `state_root = SHA-256d(utxo_root)`, where the root
+is a Sparse Merkle Tree over the UTXO set. A bootstrapping node verifies
+the root by applying each block over a read-only overlay and recomputing
+it, so the PoW secures the resulting state, not just transitions.
+See [state.md](state.md).
 
 ### Stage 14 — Signature-scheme agility (SignatureScheme)
-Every `TxIn` declares `scheme: SignatureScheme` (`Wots256` active at launch;
+Every `TxIn` declares `scheme: SignatureScheme` (`Mldsa2` active at launch;
 `Reserved1..3` recognized-but-inactive; `Unknown` rejected). `validate_tx`
 dispatches per scheme; the scheme byte is part of the sighash, binding each
 signature to its scheme. Reserved ids leave room for future post-quantum /
@@ -108,7 +95,7 @@ hybrid schemes without a flag-day fork.
 
 ### Stage 15 — Snapshot + fast-sync
 `FileStore::save_snapshot` / `load_snapshot` let a node bootstrap from a
-trusted state snapshot (UTXO + burnt + tip block) instead of replaying from
+trusted state snapshot (UTXO + tip block) instead of replaying from
 genesis. Loading is trustless: the stored `state_root` is recomputed and a
 mismatch (tampering) is rejected. Versioned format (`magic "LITS"`, `version`)
 with a tamper-detection test. Node CLI: `--archive`, `--verify-from-genesis`,
@@ -130,18 +117,17 @@ pinned as a checkpoint at testnet launch.
 - **Stage 18 — P2P smoke / 2-node sync test** and **compact-block relay**.
   - `p2p_handshake_and_block_relay` unit test now covers handshake + `inv`/
     `getdata`/block relay over loopback TCP (DONE).
-- **Stage 19 — Throughput benchmark** for WOTS+ `w=256` (already active) and
-  tx/s under block validation. WOTS+ witness/throughput numbers added to
-  `docs/benchmarks.md` (DONE).
+- **Stage 19 — Throughput benchmark** for ML-DSA-2 and tx/s under block
+  validation. Numbers added to `docs/benchmarks.md` (DONE).
 
-## Stage 20 — ML-DSA-2 migration (Dilithium, FIPS 204)
+## Stage 20 — ML-DSA-2 migration (Dilithium, FIPS 204) — **DONE**
 
-Replace WOTS+ + ML-KEM with ML-DSA-2 as the sole signature scheme.
+Replaced WOTS+ + ML-KEM with ML-DSA-2 as the sole signature scheme.
 Pre-mainnet breaking change. See [ml-dsa-migration.md](ml-dsa-migration.md).
 
-**Why:** ~1300-char stealth addresses → ~40-char `litc1q...` addresses.
-Reusable stateless keys. Simpler wallet (no stealth scan, no KEM, no burnt
-keys). ~13% smaller transactions. Same post-quantum security class.
+**Result:** ~40-char `litc1q...` addresses, reusable stateless keys,
+simpler wallet (no stealth scan, no KEM, no burnt keys). Same
+post-quantum security class (module-LWE/SIS, FIPS 204).
 
 ### Phase 1 — Add ML-DSA-2 alongside WOTS+
 1. Add `pqcrypto-dilithium` crate to `litc-primitives`.

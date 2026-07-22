@@ -16,9 +16,10 @@ is not added.
 - **Open** — the specification is public, compact, and free of hidden magic.
 - **Commodity hardware** — mining must work on a humble CPU and an old GPU
   (GTX 650); fairness comes from the algorithm, not from banning hardware.
-- **Quantum-resistant by design** — signatures use WOTS+, a hash-based
-  one-time signature. LiTC does not need a future hard fork to survive a
-  quantum computer; it is built that way from the first block.
+- **Quantum-resistant by design** — signatures use ML-DSA-2 (Dilithium,
+  NIST FIPS 204), a lattice-based post-quantum scheme. LiTC does not need
+  a future hard fork to survive a quantum computer; it is built that way
+  from the first block.
 - **Linux-first** — the reference platform is a plain Linux box, not a cloud.
 - **No unnecessary dependencies** — a dependency is a liability. Add one only
   when it clearly makes LiTC *simpler* or *better for the user*.
