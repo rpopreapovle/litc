@@ -7,12 +7,12 @@
 //!   2. the ML-DSA-2 signature verifies against the transaction sighash and the
 //!      committed `HASH160(pk)`.
 
-use litc_primitives::{
-    sha256d, to_bytes, hash160, mldsa, Amount, Block, BlockHeader, Hash32, OutPoint, SignatureScheme,
-    Transaction, TxIn, TxOut,
-};
-use litc_primitives::chainparams::ChainParams;
 use litc_pow::EPOCH_BLOCKS;
+use litc_primitives::chainparams::ChainParams;
+use litc_primitives::{
+    hash160, mldsa, sha256d, to_bytes, Amount, Block, BlockHeader, Hash32, OutPoint,
+    SignatureScheme, Transaction, TxIn, TxOut,
+};
 use litc_store::state::{OverlayState, StateStore, UtxoEntry};
 use litc_store::SpendStore;
 use std::collections::HashSet;
@@ -157,10 +157,7 @@ pub fn validate_tx<S: StateStore>(
 ///   - the `epoch_seed` must match the parent (or `H(prev_block)` at an epoch
 ///     boundary),
 ///   - the timestamp must advance past the parent and not be far in the future.
-pub fn validate_block_header<S: SpendStore>(
-    block: &Block,
-    store: &S,
-) -> Result<(), String> {
+pub fn validate_block_header<S: SpendStore>(block: &Block, store: &S) -> Result<(), String> {
     let height = block.header.height;
     if height == 0 {
         // Genesis: no parent to check.
@@ -212,10 +209,7 @@ pub fn validate_checkpoint(block: &Block, params: &ChainParams) -> Result<(), St
 ///   - no intra-block double spend,
 ///   - `sum(outputs) <= sum(inputs)` for every spend (delegated to `validate_tx`),
 ///   - coinbase value `<= block_subsidy(height) + total_fees`.
-pub fn validate_block_value<S: StateStore>(
-    block: &Block,
-    store: &S,
-) -> Result<(), String> {
+pub fn validate_block_value<S: StateStore>(block: &Block, store: &S) -> Result<(), String> {
     let mut spent_in_block: HashSet<OutPoint> = HashSet::new();
     let mut sum_fees: u64 = 0;
     let mut seen_coinbase = false;
@@ -463,7 +457,11 @@ pub fn reorganize<S: SpendStore + StateStore>(store: &mut S) {
 }
 
 /// Connect every block on the path from `ancestor`'s child up to `tip`.
-fn connect_branch<S: SpendStore + StateStore>(store: &mut S, tip: Hash32, ancestor: Option<Hash32>) {
+fn connect_branch<S: SpendStore + StateStore>(
+    store: &mut S,
+    tip: Hash32,
+    ancestor: Option<Hash32>,
+) {
     for bhash in path_to(store, tip, ancestor) {
         if !store.is_applied(&bhash) {
             if let Some(block) = store.get_block(&bhash) {
@@ -639,7 +637,10 @@ mod tests {
         assert!(!store.is_applied(&a2.block_hash()));
         // UTXO set reflects chain B: g + b1 + b2 + b3 = 4 coinbases.
         assert_eq!(litc_store::UtxoStore::iter_utxos(&store).len(), 4);
-        let bal: u64 = litc_store::UtxoStore::iter_utxos(&store).iter().map(|(_, o)| o.value.0).sum();
+        let bal: u64 = litc_store::UtxoStore::iter_utxos(&store)
+            .iter()
+            .map(|(_, o)| o.value.0)
+            .sum();
         assert_eq!(bal, 4 * 5 * 100_000_000);
 
         // A weaker fork must NOT trigger a reorg.
@@ -678,11 +679,7 @@ mod tests {
     /// suite stays fast; used to mature coinbase outputs before spending them.
     fn extend(store: &mut MemoryStore, mut prev: Hash32, n: u64) -> Hash32 {
         for h in 1..=n {
-            let b = block(
-                prev,
-                h,
-                vec![cb([h as u8; 20], Amount(5 * 100_000_000))],
-            );
+            let b = block(prev, h, vec![cb([h as u8; 20], Amount(5 * 100_000_000))]);
             apply_block(store, &b).unwrap();
             prev = b.block_hash();
         }

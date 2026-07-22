@@ -517,12 +517,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             read_u32(&self.device, &self.staging_count)
         }
 
-        fn gpu_digest(
-            &self,
-            nonce: u64,
-            challenge: &[u8; 32],
-            seed: &[u8; 32],
-        ) -> [u8; 32] {
+        fn gpu_digest(&self, nonce: u64, challenge: &[u8; 32], seed: &[u8; 32]) -> [u8; 32] {
             let x_bytes = self.gpu_x_steps_for_test(nonce, challenge, seed, WALK);
             let nb = nonce.to_le_bytes();
             let mut tail = Vec::with_capacity(32 + 32 + 8 + 32);
@@ -531,9 +526,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             tail.extend_from_slice(&nb);
             tail.extend_from_slice(challenge);
             sha256d(&tail).0
-    }
+        }
 
-    fn gpu_x_steps_for_test(
+        fn gpu_x_steps_for_test(
             &self,
             nonce: u64,
             challenge: &[u8; 32],
@@ -541,7 +536,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             steps: usize,
         ) -> [u8; 32] {
             let scratch = prepare_epoch(seed);
-            self.queue.write_buffer(&self.scratch_buf, 0, scratch.as_bytes());
+            self.queue
+                .write_buffer(&self.scratch_buf, 0, scratch.as_bytes());
             let _ = self.write_params(nonce, challenge, seed, steps as u32, 1);
             self.queue
                 .write_buffer(&self.count_buf, 0, &0u32.to_ne_bytes());
@@ -576,12 +572,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if p + 9 * 4 > cands.len() {
                     break;
                 }
-                let nonce_out = u32::from_ne_bytes([cands[p], cands[p + 1], cands[p + 2], cands[p + 3]]);
+                let nonce_out =
+                    u32::from_ne_bytes([cands[p], cands[p + 1], cands[p + 2], cands[p + 3]]);
                 if nonce_out == base_lo {
                     for (k, slot) in x_words.iter_mut().enumerate() {
                         let q = p + (1 + k) * 4;
-                        *slot =
-                            u32::from_ne_bytes([cands[q], cands[q + 1], cands[q + 2], cands[q + 3]]);
+                        *slot = u32::from_ne_bytes([
+                            cands[q],
+                            cands[q + 1],
+                            cands[q + 2],
+                            cands[q + 3],
+                        ]);
                     }
                     break;
                 }

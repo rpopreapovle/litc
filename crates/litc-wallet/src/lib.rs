@@ -129,8 +129,14 @@ mod tests {
     fn derivation_deterministic_and_distinct() {
         let w1 = Wallet::new([0x11u8; 32]);
         let w2 = Wallet::new([0x11u8; 32]);
-        assert_eq!(w1.address_at(0, mldsa::MAINNET_VERSION), w2.address_at(0, mldsa::MAINNET_VERSION));
-        assert_ne!(w1.address_at(0, mldsa::MAINNET_VERSION), w1.address_at(1, mldsa::MAINNET_VERSION));
+        assert_eq!(
+            w1.address_at(0, mldsa::MAINNET_VERSION),
+            w2.address_at(0, mldsa::MAINNET_VERSION)
+        );
+        assert_ne!(
+            w1.address_at(0, mldsa::MAINNET_VERSION),
+            w1.address_at(1, mldsa::MAINNET_VERSION)
+        );
     }
 
     #[test]

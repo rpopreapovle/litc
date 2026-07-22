@@ -6,10 +6,10 @@
 // — ~40 characters.
 // ---------------------------------------------------------------------------
 
-use ml_dsa::{MlDsa44, Signer, Verifier, KeyInit, KeyExport, Keypair, Seed, SignatureEncoding};
+use ml_dsa::{KeyExport, KeyInit, Keypair, MlDsa44, Seed, SignatureEncoding, Signer, Verifier};
 use sha2::{Digest, Sha256};
 
-use crate::{hash160, bech32m_encode, bech32m_decode};
+use crate::{bech32m_decode, bech32m_encode, hash160};
 
 pub const PK_LEN: usize = 1312;
 pub const SIG_LEN: usize = 2420;
@@ -124,7 +124,11 @@ mod tests {
         // Wrong message should fail
         let mut wrong_msg = msg;
         wrong_msg[0] ^= 0xFF;
-        assert!(!MlDsaKeypair::verify(&kp.public_key_bytes(), &wrong_msg, &sig));
+        assert!(!MlDsaKeypair::verify(
+            &kp.public_key_bytes(),
+            &wrong_msg,
+            &sig
+        ));
     }
 
     #[test]

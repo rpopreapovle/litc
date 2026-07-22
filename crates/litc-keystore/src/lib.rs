@@ -85,7 +85,9 @@ fn fill_random(buf: &mut [u8]) -> Result<(), String> {
     let pid = std::process::id();
     let mut state = t.as_nanos() as u64 ^ (pid as u64) << 32;
     for chunk in buf.chunks_mut(8) {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let n = chunk.len().min(8);
         chunk[..n].copy_from_slice(&state.to_le_bytes()[..n]);
     }

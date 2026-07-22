@@ -66,7 +66,11 @@ impl LightWallet {
         self.wallet.commitment_at(index)
     }
 
-    fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
+    fn rpc_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -79,9 +83,8 @@ impl LightWallet {
                 .set("Content-Type", "application/json")
                 .send_string(&body.to_string())
                 .map_err(|e| Error::Http(e.to_string()))?;
-            let json: serde_json::Value = resp
-                .into_json()
-                .map_err(|e| Error::Json(e.to_string()))?;
+            let json: serde_json::Value =
+                resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
             if let Some(err) = json.get("error").and_then(|e| e.as_object()) {
                 let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                 let msg = err
@@ -90,7 +93,10 @@ impl LightWallet {
                     .unwrap_or("unknown");
                 return Err(Error::Api(code, msg.to_string()));
             }
-            Ok(json.get("result").cloned().unwrap_or(serde_json::Value::Null))
+            Ok(json
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
         }
         #[cfg(target_arch = "wasm32")]
         Err(Error::Http("HTTP not available on wasm32".into()))
@@ -108,7 +114,7 @@ impl LightWallet {
     }
 
     pub fn fetch_utxos(&self, commitments: &[[u8; 20]]) -> Result<Vec<UtxoInfo>, Error> {
-        let hex_list: Vec<String> = commitments.iter().map(|c| hex::encode(c)).collect();
+        let hex_list: Vec<String> = commitments.iter().map(hex::encode).collect();
         let v = self.rpc_call("get_utxos", serde_json::json!([hex_list]))?;
         serde_json::from_value(v).map_err(|e| Error::Json(e.to_string()))
     }
@@ -125,8 +131,7 @@ impl LightWallet {
 
     pub fn fetch_block_count(&self) -> Result<u64, Error> {
         let v = self.rpc_call("getblockcount", serde_json::json!([]))?;
-        v.as_u64()
-            .ok_or_else(|| Error::Json("expected u64".into()))
+        v.as_u64().ok_or_else(|| Error::Json("expected u64".into()))
     }
 
     pub fn build_send(
@@ -236,10 +241,16 @@ mod tests {
         assert_eq!(tx.outputs[0].value, Amount(100_000_000));
         assert_eq!(tx.outputs[0].script_pubkey, to_commit.to_vec());
         assert_eq!(tx.outputs[1].value, Amount(400_000_000));
-        assert_eq!(tx.outputs[1].script_pubkey, lw.wallet.commitment_at(1).to_vec());
+        assert_eq!(
+            tx.outputs[1].script_pubkey,
+            lw.wallet.commitment_at(1).to_vec()
+        );
         assert_eq!(tx.inputs[0].scheme, SignatureScheme::Mldsa2);
         // script_sig = pk (1312) + sig (2420) = 3732 bytes
-        assert_eq!(tx.inputs[0].script_sig.len(), mldsa::PK_LEN + mldsa::SIG_LEN);
+        assert_eq!(
+            tx.inputs[0].script_sig.len(),
+            mldsa::PK_LEN + mldsa::SIG_LEN
+        );
     }
 
     #[test]

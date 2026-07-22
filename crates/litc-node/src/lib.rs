@@ -20,18 +20,14 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use litc_core::{
-    block_state_root, reorganize, validate_block_header, validate_block_pow_merkle, validate_tx,
-    block_subsidy_with, validate_checkpoint,
+    block_state_root, block_subsidy_with, reorganize, validate_block_header,
+    validate_block_pow_merkle, validate_checkpoint, validate_tx,
 };
 use litc_keystore::FileKeyStore;
 use litc_miner::{assemble_block, BlockTemplate, CpuMiner, MinerBackend};
-use litc_pow::{
-    adjust_target, block_work, EPOCH_BLOCKS, INITIAL_TARGET, TARGET_TIMESPAN,
-};
-use litc_primitives::{
-    sha256d, to_bytes, Block, Decodable, Hash32, Reader, Transaction,
-};
+use litc_pow::{adjust_target, block_work, EPOCH_BLOCKS, INITIAL_TARGET, TARGET_TIMESPAN};
 use litc_primitives::chainparams::{ChainParams, Network};
+use litc_primitives::{sha256d, to_bytes, Block, Decodable, Hash32, Reader, Transaction};
 use litc_store::state::StateStore;
 use litc_store::{FileStore, PruneConfig, SpendStore};
 use litc_wallet::Wallet;
@@ -361,7 +357,14 @@ impl<S: SpendStore + StateStore> Node<S> {
         }
         // Per-peer block rate limit (DoS guard against header-rain attacks).
         // Skip for locally mined blocks.
-        if from != LOCAL && !peer_rate_allowed(&mut self.peer_block, &from, PEER_BLOCK_WINDOW, PEER_BLOCK_LIMIT) {
+        if from != LOCAL
+            && !peer_rate_allowed(
+                &mut self.peer_block,
+                &from,
+                PEER_BLOCK_WINDOW,
+                PEER_BLOCK_LIMIT,
+            )
+        {
             return false;
         }
         let target = self.target_for(height);
@@ -482,12 +485,17 @@ impl<S: SpendStore + StateStore> Node<S> {
         }
         // Bound memory usage if a peer floods us with valid transactions.
         if self.mempool.len() >= MAX_MEMPOOL {
-            eprintln!("{YELLOW}{BOLD}[mempool]{RESET} full ({}), dropping tx", self.mempool.len());
+            eprintln!(
+                "{YELLOW}{BOLD}[mempool]{RESET} full ({}), dropping tx",
+                self.mempool.len()
+            );
             return false;
         }
         // Per-peer transaction rate limit (DoS guard).
         if !peer_rate_allowed(&mut self.peer_tx, &from, PEER_TX_WINDOW, PEER_TX_LIMIT) {
-            eprintln!("{YELLOW}{BOLD}[p2p]{RESET} {YELLOW}peer {from} exceeded tx rate limit{RESET}");
+            eprintln!(
+                "{YELLOW}{BOLD}[p2p]{RESET} {YELLOW}peer {from} exceeded tx rate limit{RESET}"
+            );
             return false;
         }
         // Validate against the current UTXO set at the prospective next height.
@@ -594,11 +602,15 @@ fn connect_to<S: SpendStore + StateStore + Send + 'static>(
         }
         let p = peers.lock().unwrap();
         if p.contains_key(&addr) {
-            eprintln!("{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already in peers){RESET}");
+            eprintln!(
+                "{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already in peers){RESET}"
+            );
             return;
         }
         if !connecting.lock().unwrap().insert(addr) {
-            eprintln!("{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already connecting){RESET}");
+            eprintln!(
+                "{DIM}{BOLD}[p2p]{RESET} {DIM}connect_to skip {addr} (already connecting){RESET}"
+            );
             return;
         }
     }
@@ -635,7 +647,11 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
 ) -> bool {
     let codec = Codec::new(node.lock().unwrap().params.magic);
     match msg {
-        Message::Version { from, nonce: peer_nonce, .. } => {
+        Message::Version {
+            from,
+            nonce: peer_nonce,
+            ..
+        } => {
             {
                 let map = peers.lock().unwrap();
                 // If this nonce matches our own, the peer connected to itself — drop.
@@ -754,7 +770,14 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 let already = peers.lock().unwrap().contains_key(&sa);
                 if !already {
                     eprintln!("{CYAN}{BOLD}[p2p]{RESET} {CYAN}connecting to {sa}{RESET}");
-                    connect_to(sa, peers.clone(), node.clone(), known.clone(), listen, connecting);
+                    connect_to(
+                        sa,
+                        peers.clone(),
+                        node.clone(),
+                        known.clone(),
+                        listen,
+                        connecting,
+                    );
                 }
             }
         }
@@ -772,7 +795,6 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                         }]),
                         Some(&addr),
                     );
-
                 }
             }
             Err(e) => eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}bad block payload: {e}{RESET}"),
@@ -791,7 +813,10 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                         }]),
                         Some(&addr),
                     );
-                    println!("{GREEN}{BOLD}[p2p]{RESET} {GREEN}accepted relayed tx {}{RESET}", hex(&id.0[..4]));
+                    println!(
+                        "{GREEN}{BOLD}[p2p]{RESET} {GREEN}accepted relayed tx {}{RESET}",
+                        hex(&id.0[..4])
+                    );
                 }
             }
             Err(e) => eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}bad tx payload: {e}{RESET}"),
@@ -853,7 +878,9 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
         }
         // DoS guard: bound unparsed buffer growth.
         if buf.len() > litc_wire::MAX_FRAME * 2 {
-            eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}peer {addr} exceeded buffer limit; dropping{RESET}");
+            eprintln!(
+                "{RED}{BOLD}[p2p]{RESET} {RED}peer {addr} exceeded buffer limit; dropping{RESET}"
+            );
             break;
         }
         let mut disconnected = false;
@@ -978,7 +1005,10 @@ fn load_mempool<S: SpendStore + StateStore>(
         let tx = match Transaction::decode(&mut Reader::new(&bytes)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("{RED}{BOLD}[mempool]{RESET} {RED}bad tx file {}: {e}{RESET}", path.display());
+                eprintln!(
+                    "{RED}{BOLD}[mempool]{RESET} {RED}bad tx file {}: {e}{RESET}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -995,7 +1025,10 @@ fn load_mempool<S: SpendStore + StateStore>(
                 None,
             );
             let _ = std::fs::remove_file(&path);
-            println!("{GREEN}{BOLD}[mempool]{RESET} {GREEN}loaded tx {}{RESET}", hex(&id.0[..4]));
+            println!(
+                "{GREEN}{BOLD}[mempool]{RESET} {GREEN}loaded tx {}{RESET}",
+                hex(&id.0[..4])
+            );
         }
     }
 }
@@ -1018,7 +1051,8 @@ pub fn run(args: Vec<String>) {
     let mut save_snapshot: Option<String> = None;
     let mut network = Network::Testnet;
     let mut rpc_port: Option<u16> = None;
-    let mut rpc_bind: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    let mut rpc_bind: std::net::IpAddr =
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1120,7 +1154,10 @@ pub fn run(args: Vec<String>) {
         Network::Mainnet => ChainParams::mainnet(),
         Network::Testnet => ChainParams::testnet(),
     };
-    println!("{MAGENTA}{BOLD}[net]{RESET} {MAGENTA}network = {}{RESET}", network.as_str());
+    println!(
+        "{MAGENTA}{BOLD}[net]{RESET} {MAGENTA}network = {}{RESET}",
+        network.as_str()
+    );
 
     // `--verify-from-genesis` intentionally wipes any existing state so the node
     // re-derives everything from block 0 (the only fully trustless path).
@@ -1139,7 +1176,8 @@ pub fn run(args: Vec<String>) {
     // local chain store.
     let store = if let Some(snap) = &fast_sync {
         println!("{CYAN}{BOLD}[fast-sync]{RESET} {CYAN}loading snapshot from {snap}{RESET}");
-        FileStore::load_snapshot(snap, &params).expect("cannot load snapshot (state_root mismatch?)")
+        FileStore::load_snapshot(snap, &params)
+            .expect("cannot load snapshot (state_root mismatch?)")
     } else {
         FileStore::open(data_dir.clone(), prune).expect("cannot open chain store")
     };
@@ -1371,7 +1409,8 @@ mod tests {
                 }
             };
             // Reply with `getdata` asking for that block.
-            s.write_all(&codec.frame(&Message::GetData(inv.clone()))).unwrap();
+            s.write_all(&codec.frame(&Message::GetData(inv.clone())))
+                .unwrap();
             // Receive the `block` frame and return its hash.
             loop {
                 let n = read_some(&mut s, &mut tmp).expect("server: peer closed before block");
@@ -1410,7 +1449,8 @@ mod tests {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 8192];
         loop {
-            let n = read_some(&mut client_stream, &mut tmp).expect("client: server closed before verack");
+            let n = read_some(&mut client_stream, &mut tmp)
+                .expect("client: server closed before verack");
             buf.extend_from_slice(&tmp[..n]);
             if let Ok(Some((m, consumed))) = codec.parse(&buf) {
                 buf.drain(..consumed);
@@ -1419,7 +1459,9 @@ mod tests {
                 }
             }
         }
-        client_stream.write_all(&codec.frame(&Message::Verack)).unwrap();
+        client_stream
+            .write_all(&codec.frame(&Message::Verack))
+            .unwrap();
 
         // Build a valid (tiny-target) PoW block and announce it via `inv`.
         let target = [0xFFu8; 32];

@@ -13,9 +13,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 use litc_keystore::FileKeyStore;
-use litc_primitives::{
-    to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
-};
+use litc_primitives::{to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN};
 use litc_store::{BlockStore, FileStore, SpendStore, UtxoStore};
 use litc_wallet::Wallet;
 
@@ -102,7 +100,7 @@ fn handle_getbestblockhash(node: &Node<FileStore>, _params: &[Value], id: Value)
 }
 
 fn handle_getblockhash(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let height = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+    let height = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
     match node.chain.get(&height) {
         Some((hash, _ts)) => ok(json!(hash.to_hex()), id),
         None => err(-5, "block height out of range", id),
@@ -120,10 +118,7 @@ fn hash32_from_hex(s: &str) -> Option<Hash32> {
 }
 
 fn handle_getblock(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let hash_hex = params
-        .get(0)
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let hash_hex = params.first().and_then(|v| v.as_str()).unwrap_or("");
     let hash = match hash32_from_hex(hash_hex) {
         Some(h) => h,
         None => return err(-5, "invalid block hash", id),
@@ -134,26 +129,26 @@ fn handle_getblock(node: &Node<FileStore>, params: &[Value], id: Value) -> Strin
             if verbose == 0 {
                 ok(json!(hex::encode(to_bytes(&block))), id)
             } else {
-                let tx_hashes: Vec<String> = block
-                    .txs
-                    .iter()
-                    .map(|tx| tx.txid().to_hex())
-                    .collect();
-                ok(json!({
-                    "hash": hash.to_hex(),
-                    "height": block.header.height,
-                    "version": block.header.version,
-                    "prev_block": block.header.prev_block.to_hex(),
-                    "merkle_root": block.header.merkle_root.to_hex(),
-                    "state_root": block.header.state_root.to_hex(),
-                    "timestamp": block.header.timestamp,
-                    "nonce": block.header.nonce,
-                    "difficulty_bits": {
-                        "leading_zeros": block.header.nonce.leading_zeros(),
-                    },
-                    "tx_count": block.txs.len(),
-                    "tx": tx_hashes,
-                }), id)
+                let tx_hashes: Vec<String> =
+                    block.txs.iter().map(|tx| tx.txid().to_hex()).collect();
+                ok(
+                    json!({
+                        "hash": hash.to_hex(),
+                        "height": block.header.height,
+                        "version": block.header.version,
+                        "prev_block": block.header.prev_block.to_hex(),
+                        "merkle_root": block.header.merkle_root.to_hex(),
+                        "state_root": block.header.state_root.to_hex(),
+                        "timestamp": block.header.timestamp,
+                        "nonce": block.header.nonce,
+                        "difficulty_bits": {
+                            "leading_zeros": block.header.nonce.leading_zeros(),
+                        },
+                        "tx_count": block.txs.len(),
+                        "tx": tx_hashes,
+                    }),
+                    id,
+                )
             }
         }
         None => err(-5, "block not found", id),
@@ -162,19 +157,28 @@ fn handle_getblock(node: &Node<FileStore>, params: &[Value], id: Value) -> Strin
 
 fn handle_getinfo(node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id: Value) -> String {
     let peers_len = peers.lock().unwrap().len();
-    ok(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "network": node.params.network.as_str(),
-        "blocks": node.best_height(),
-        "best_block_hash": node.tip.to_hex(),
-        "difficulty_bits": node.difficulty_bits(),
-        "mempool_size": node.mempool.len(),
-        "known_txs": node.known_txs.len(),
-        "connections": peers_len,
-    }), id)
+    ok(
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "network": node.params.network.as_str(),
+            "blocks": node.best_height(),
+            "best_block_hash": node.tip.to_hex(),
+            "difficulty_bits": node.difficulty_bits(),
+            "mempool_size": node.mempool.len(),
+            "known_txs": node.known_txs.len(),
+            "connections": peers_len,
+        }),
+        id,
+    )
 }
 
-fn handle_getbalance(node: &Node<FileStore>, w: &Wallet, _ks: &FileKeyStore, _params: &[Value], id: Value) -> String {
+fn handle_getbalance(
+    node: &Node<FileStore>,
+    w: &Wallet,
+    _ks: &FileKeyStore,
+    _params: &[Value],
+    id: Value,
+) -> String {
     let mut sum: u64 = 0;
     let mut idx = 0u32;
     loop {
@@ -201,10 +205,13 @@ fn handle_getbalance(node: &Node<FileStore>, w: &Wallet, _ks: &FileKeyStore, _pa
             break;
         }
     }
-    ok(json!({
-        "balance": sum,
-        "balance_formatted": format_amount(sum),
-    }), id)
+    ok(
+        json!({
+            "balance": sum,
+            "balance_formatted": format_amount(sum),
+        }),
+        id,
+    )
 }
 
 fn handle_getaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
@@ -213,27 +220,30 @@ fn handle_getaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id:
 }
 
 fn handle_gettransaction(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let txid_hex = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let txid_hex = params.first().and_then(|v| v.as_str()).unwrap_or("");
     let txid = match hash32_from_hex(txid_hex) {
         Some(h) => h,
         None => return err(-5, "invalid txid", id),
     };
     for tx in &node.mempool {
         if tx.txid() == txid {
-            return ok(json!({
-                "txid": txid.to_hex(),
-                "hex": hex::encode(to_bytes(tx)),
-                "mempool": true,
-                "inputs": tx.inputs.len(),
-                "outputs": tx.outputs.len(),
-            }), id);
+            return ok(
+                json!({
+                    "txid": txid.to_hex(),
+                    "hex": hex::encode(to_bytes(tx)),
+                    "mempool": true,
+                    "inputs": tx.inputs.len(),
+                    "outputs": tx.outputs.len(),
+                }),
+                id,
+            );
         }
     }
     err(-5, "transaction not found", id)
 }
 
 fn handle_listunspent(node: &Node<FileStore>, _w: &Wallet, params: &[Value], id: Value) -> String {
-    let min_amt = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+    let min_amt = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
     let mut utxos: Vec<Value> = Vec::new();
     let store: &FileStore = &node.store;
     for (op, out) in UtxoStore::iter_utxos(store) {
@@ -258,12 +268,12 @@ fn handle_send(
     params: &[Value],
     id: Value,
 ) -> String {
-    let to = params.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let value = match params
-        .get(1)
+    let to = params
+        .first()
         .and_then(|v| v.as_str())
-        .map(|s| parse_amount(s))
-    {
+        .unwrap_or("")
+        .to_string();
+    let value = match params.get(1).and_then(|v| v.as_str()).map(parse_amount) {
         Some(Ok(v)) => Amount(v),
         Some(Err(e)) => return err(-5, &e, id),
         None => return err(-32602, "invalid amount", id),
@@ -277,25 +287,31 @@ fn handle_send(
         Ok(tx) => {
             write_tx(&tx);
             let hex_str: String = to_bytes(&tx).iter().map(|b| format!("{b:02x}")).collect();
-            ok(json!({
-                "txid": tx.txid().to_hex(),
-                "hex": hex_str,
-            }), id)
+            ok(
+                json!({
+                    "txid": tx.txid().to_hex(),
+                    "hex": hex_str,
+                }),
+                id,
+            )
         }
         Err(e) => err(-5, &format!("send failed: {e}"), id),
     }
 }
 
 fn handle_getmininginfo(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
-    ok(json!({
-        "blocks": node.best_height(),
-        "difficulty_bits": node.difficulty_bits(),
-        "mempool_count": node.mempool.len(),
-    }), id)
+    ok(
+        json!({
+            "blocks": node.best_height(),
+            "difficulty_bits": node.difficulty_bits(),
+            "mempool_count": node.mempool.len(),
+        }),
+        id,
+    )
 }
 
 fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
-    let hex_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let hex_str = params.first().and_then(|v| v.as_str()).unwrap_or("");
     let bytes = match hex::decode(hex_str) {
         Ok(b) => b,
         Err(_) => return err(-5, "invalid hex", id),
@@ -309,7 +325,11 @@ fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -
         return err(-25, "block rejected", id);
     }
     // Track the submitter in the pool.
-    let worker_name = params.get(1).and_then(|v| v.as_str()).unwrap_or("anon").to_string();
+    let worker_name = params
+        .get(1)
+        .and_then(|v| v.as_str())
+        .unwrap_or("anon")
+        .to_string();
     let addr = from;
     let height = node.best_height();
     if let Some(w) = node.pool_workers.iter_mut().find(|w| w.name == worker_name) {
@@ -329,7 +349,11 @@ fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -
 
 fn handle_getblocktemplate(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
     // Track the requestor as a pool worker.
-    let worker_name = params.get(0).and_then(|v| v.as_str()).unwrap_or("anon").to_string();
+    let worker_name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .unwrap_or("anon")
+        .to_string();
     let addr = "0.0.0.0:0".parse().unwrap();
     if !node.pool_workers.iter().any(|w| w.name == worker_name) {
         node.pool_workers.push(crate::PoolWorker {
@@ -344,30 +368,47 @@ fn handle_getblocktemplate(node: &mut Node<FileStore>, params: &[Value], id: Val
     let candidate = crate::assemble_block(&template);
     let header_nonce0 = to_bytes(&candidate.header);
     let block_hex = to_bytes(&candidate);
-    ok(json!({
-        "height": template.height,
-        "header_hex": hex::encode(&header_nonce0),
-        "block_hex": hex::encode(&block_hex),
-        "target_hex": hex::encode(&target),
-        "prev_block": template.prev_block.to_hex(),
-        "epoch_seed": template.epoch_seed.to_hex(),
-        "state_root": template.state_root.to_hex(),
-        "coinbase_value": template.coinbase_value.0,
-    }), id)
+    ok(
+        json!({
+            "height": template.height,
+            "header_hex": hex::encode(&header_nonce0),
+            "block_hex": hex::encode(&block_hex),
+            "target_hex": hex::encode(target),
+            "prev_block": template.prev_block.to_hex(),
+            "epoch_seed": template.epoch_seed.to_hex(),
+            "state_root": template.state_root.to_hex(),
+            "coinbase_value": template.coinbase_value.0,
+        }),
+        id,
+    )
 }
 
 fn handle_getpoolinfo(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
-    let workers: Vec<Value> = node.pool_workers.iter().map(|w| json!({
-        "name": w.name,
-        "addr": w.addr.to_string(),
-        "blocks_found": w.blocks_found,
-        "shares": w.shares,
-        "last_height": w.last_height,
-    })).collect();
-    ok(json!({"workers": workers, "total_workers": workers.len()}), id)
+    let workers: Vec<Value> = node
+        .pool_workers
+        .iter()
+        .map(|w| {
+            json!({
+                "name": w.name,
+                "addr": w.addr.to_string(),
+                "blocks_found": w.blocks_found,
+                "shares": w.shares,
+                "last_height": w.last_height,
+            })
+        })
+        .collect();
+    ok(
+        json!({"workers": workers, "total_workers": workers.len()}),
+        id,
+    )
 }
 
-fn handle_getpeerinfo(_node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id: Value) -> String {
+fn handle_getpeerinfo(
+    _node: &Node<FileStore>,
+    peers: &PeerMap,
+    _params: &[Value],
+    id: Value,
+) -> String {
     let peers_guard = peers.lock().unwrap();
     let info: Vec<Value> = peers_guard
         .keys()
@@ -376,29 +417,42 @@ fn handle_getpeerinfo(_node: &Node<FileStore>, peers: &PeerMap, _params: &[Value
     ok(json!(info), id)
 }
 
-fn handle_getconnectioncount(_node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id: Value) -> String {
+fn handle_getconnectioncount(
+    _node: &Node<FileStore>,
+    peers: &PeerMap,
+    _params: &[Value],
+    id: Value,
+) -> String {
     ok(json!(peers.lock().unwrap().len()), id)
 }
 
 fn handle_get_utxos(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let commits: Vec<String> = match params.get(0) {
-        Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+    let commits: Vec<String> = match params.first() {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         _ => return err(-32602, "expected array of hex commitments", id),
     };
     // Build a set of commits to filter on.
-    let targets: Vec<Option<[u8; 20]>> = commits.iter().map(|h| {
-        let b = hex::decode(h).ok()?;
-        if b.len() != 20 { return None; }
-        let mut c = [0u8; 20];
-        c.copy_from_slice(&b);
-        Some(c)
-    }).collect();
+    let targets: Vec<Option<[u8; 20]>> = commits
+        .iter()
+        .map(|h| {
+            let b = hex::decode(h).ok()?;
+            if b.len() != 20 {
+                return None;
+            }
+            let mut c = [0u8; 20];
+            c.copy_from_slice(&b);
+            Some(c)
+        })
+        .collect();
     let mut results = Vec::new();
     for (op, out) in node.store.iter_utxos() {
         let Ok(commit) = <[u8; 20]>::try_from(out.script_pubkey.as_slice()) else {
             continue;
         };
-        if !targets.iter().any(|t| t.as_ref().map_or(false, |t| t == &commit)) {
+        if !targets.iter().any(|t| t.as_ref() == Some(&commit)) {
             continue;
         }
         let height = node.store.coinbase_height(&op).unwrap_or(0);
@@ -414,7 +468,7 @@ fn handle_get_utxos(node: &Node<FileStore>, params: &[Value], id: Value) -> Stri
 }
 
 fn handle_get_tx(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let txid_hex = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let txid_hex = params.first().and_then(|v| v.as_str()).unwrap_or("");
     let txid = match hash32_from_hex(txid_hex) {
         Some(h) => h,
         None => return err(-5, "invalid txid", id),
@@ -422,10 +476,13 @@ fn handle_get_tx(node: &Node<FileStore>, params: &[Value], id: Value) -> String 
     // Check mempool first.
     for tx in &node.mempool {
         if tx.txid() == txid {
-            return ok(json!({
-                "hex": hex::encode(to_bytes(tx)),
-                "confirmations": 0,
-            }), id);
+            return ok(
+                json!({
+                    "hex": hex::encode(to_bytes(tx)),
+                    "confirmations": 0,
+                }),
+                id,
+            );
         }
     }
     // Walk the best chain backwards to find the tx.
@@ -436,10 +493,13 @@ fn handle_get_tx(node: &Node<FileStore>, params: &[Value], id: Value) -> String 
             for tx in &block.txs {
                 if tx.txid() == txid {
                     let confirmations = tip_height.saturating_sub(block.header.height) + 1;
-                    return ok(json!({
-                        "hex": hex::encode(to_bytes(tx)),
-                        "confirmations": confirmations,
-                    }), id);
+                    return ok(
+                        json!({
+                            "hex": hex::encode(to_bytes(tx)),
+                            "confirmations": confirmations,
+                        }),
+                        id,
+                    );
                 }
             }
             cur = block.header.prev_block;
@@ -451,7 +511,7 @@ fn handle_get_tx(node: &Node<FileStore>, params: &[Value], id: Value) -> String 
 }
 
 fn handle_broadcast_raw_tx(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
-    let hex_str = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+    let hex_str = params.first().and_then(|v| v.as_str()).unwrap_or("");
     let bytes = match hex::decode(hex_str) {
         Ok(b) => b,
         Err(_) => return err(-5, "invalid hex", id),
@@ -469,7 +529,7 @@ fn handle_broadcast_raw_tx(node: &mut Node<FileStore>, params: &[Value], id: Val
 }
 
 fn handle_get_header_by_height(node: &Node<FileStore>, params: &[Value], id: Value) -> String {
-    let height = params.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+    let height = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
     let hash = match node.chain.get(&height) {
         Some((h, _)) => *h,
         None => return err(-5, "height out of range", id),
@@ -478,22 +538,28 @@ fn handle_get_header_by_height(node: &Node<FileStore>, params: &[Value], id: Val
         Some(b) => b,
         None => return err(-5, "block not found", id),
     };
-    ok(json!({
-        "hex": hex::encode(to_bytes(&block.header)),
-        "hash": hash.to_hex(),
-        "height": height,
-    }), id)
+    ok(
+        json!({
+            "hex": hex::encode(to_bytes(&block.header)),
+            "hash": hash.to_hex(),
+            "height": height,
+        }),
+        id,
+    )
 }
 
 fn handle_get_network_params(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
-    ok(json!({
-        "version": 1,
-        "subsidy": litc_core::block_subsidy(node.best_height()).0,
-        "halving_interval": litc_core::HALVING_INTERVAL,
-        "coinbase_maturity": litc_core::COINBASE_MATURITY,
-        "target_interval": 15,
-        "decimals": 8,
-    }), id)
+    ok(
+        json!({
+            "version": 1,
+            "subsidy": litc_core::block_subsidy(node.best_height()).0,
+            "halving_interval": litc_core::HALVING_INTERVAL,
+            "coinbase_maturity": litc_core::COINBASE_MATURITY,
+            "target_interval": 15,
+            "decimals": 8,
+        }),
+        id,
+    )
 }
 
 fn handle_request(
@@ -621,7 +687,10 @@ fn handle_conn(
         if line.is_empty() {
             break;
         }
-        if let Some(cl) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+        if let Some(cl) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+        {
             if let Ok(n) = cl.trim().parse::<usize>() {
                 content_length = n;
             }
@@ -679,10 +748,12 @@ pub fn start(
         let wallet = Wallet::new(wallet_seed);
         let peers = peers.clone();
         thread::spawn(move || {
-            let ks = FileKeyStore::new(std::env::var("LITC_DATADIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("data"))
-                .join("wallet.dat"));
+            let ks = FileKeyStore::new(
+                std::env::var("LITC_DATADIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("data"))
+                    .join("wallet.dat"),
+            );
             handle_conn(stream, node, ks, wallet, peers);
         });
     }

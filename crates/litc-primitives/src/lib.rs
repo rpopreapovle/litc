@@ -793,7 +793,6 @@ pub mod chainparams {
                 Network::Testnet => "testnet",
             }
         }
-
     }
 
     impl std::str::FromStr for Network {
@@ -1031,10 +1030,18 @@ mod tests {
         let kp = mldsa::MlDsaKeypair::derive(&[0x42u8; 32], 0);
         let msg = [0xdeu8; 32];
         let sig = kp.sign(&msg);
-        assert!(mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &msg, &sig));
+        assert!(mldsa::MlDsaKeypair::verify(
+            &kp.public_key_bytes(),
+            &msg,
+            &sig
+        ));
         // Wrong message must fail.
         let bad = [0x00u8; 32];
-        assert!(!mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &bad, &sig));
+        assert!(!mldsa::MlDsaKeypair::verify(
+            &kp.public_key_bytes(),
+            &bad,
+            &sig
+        ));
     }
 
     #[test]
@@ -1062,7 +1069,11 @@ mod tests {
         let msg = [0xaau8; 32];
         let sig = kp.sign(&msg);
         // Signature is just raw bytes; verify still works.
-        assert!(mldsa::MlDsaKeypair::verify(&kp.public_key_bytes(), &msg, &sig));
+        assert!(mldsa::MlDsaKeypair::verify(
+            &kp.public_key_bytes(),
+            &msg,
+            &sig
+        ));
     }
 
     #[test]
@@ -1075,18 +1086,20 @@ mod tests {
         assert_eq!(t.halving_interval, 10_000);
         assert_eq!(m.halving_interval, 8_400_000);
         assert_eq!(t.network.as_str(), "testnet");
-        assert_eq!("MAINNET".parse::<chainparams::Network>(), Ok(chainparams::Network::Mainnet));
-        assert_eq!("nope".parse::<chainparams::Network>(), Err("unknown network: nope".to_string()));
+        assert_eq!(
+            "MAINNET".parse::<chainparams::Network>(),
+            Ok(chainparams::Network::Mainnet)
+        );
+        assert_eq!(
+            "nope".parse::<chainparams::Network>(),
+            Err("unknown network: nope".to_string())
+        );
     }
 
     #[test]
     fn chainparams_checkpoints() {
         let mut p = chainparams::ChainParams::testnet();
-        p.checkpoints = vec![
-            (100, [9u8; 32]),
-            (1_000, [7u8; 32]),
-            (10_000, [3u8; 32]),
-        ];
+        p.checkpoints = vec![(100, [9u8; 32]), (1_000, [7u8; 32]), (10_000, [3u8; 32])];
         assert_eq!(p.checkpoint_hash(100), Some(Hash32([9u8; 32])));
         assert_eq!(p.checkpoint_hash(101), None);
         assert_eq!(p.last_checkpoint_height(), Some(10_000));

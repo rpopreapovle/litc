@@ -312,13 +312,7 @@ mod tests {
         let mut hash = [0u8; 20];
         let mut tn = 0u8;
         assert_eq!(
-            unsafe {
-                litc_parse_address(
-                    addr_cstr.as_ptr(),
-                    hash.as_mut_ptr(),
-                    &mut tn,
-                )
-            },
+            unsafe { litc_parse_address(addr_cstr.as_ptr(), hash.as_mut_ptr(), &mut tn,) },
             0
         );
         assert_eq!(tn, 0);

@@ -7,10 +7,10 @@
 //! nodes — see `docs/running-a-node.md`).
 #![allow(clippy::items_after_test_module)]
 
+use litc_primitives::chainparams::ChainParams;
 use litc_primitives::{
     Amount, Block, BlockHeader, Decodable, Encodable, Hash32, OutPoint, Reader, Transaction, TxOut,
 };
-use litc_primitives::chainparams::ChainParams;
 use std::collections::{HashMap, HashSet};
 
 pub mod state;
@@ -400,9 +400,7 @@ impl state::StateStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litc_primitives::{
-        Amount, Block, BlockHeader, Hash32, OutPoint, Transaction, TxOut,
-    };
+    use litc_primitives::{Amount, Block, BlockHeader, Hash32, OutPoint, Transaction, TxOut};
 
     fn coinbase(commit: [u8; 20]) -> (Block, OutPoint) {
         let tx = Transaction {
@@ -662,10 +660,7 @@ fn parse_index(buf: &[u8]) -> Result<HashMap<u64, (u64, u64, bool)>, String> {
 // count:u32 | for each: txid:32 | index:u32 | value:u64 | script_len:u32
 //                    | script
 
-fn write_utxos(
-    path: &Path,
-    utxos: &HashMap<OutPoint, TxOut>,
-) -> std::io::Result<()> {
+fn write_utxos(path: &Path, utxos: &HashMap<OutPoint, TxOut>) -> std::io::Result<()> {
     let mut w = Vec::new();
     w.extend_from_slice(&(utxos.len() as u32).to_le_bytes());
     for (op, out) in utxos {
@@ -1088,11 +1083,8 @@ impl FileStore {
     }
 
     fn write_utxos(&self) -> Result<(), String> {
-        write_utxos(
-            &self.utxo_path(),
-            &self.inner.utxos,
-        )
-        .map_err(|e| format!("cannot write utxos: {e}"))
+        write_utxos(&self.utxo_path(), &self.inner.utxos)
+            .map_err(|e| format!("cannot write utxos: {e}"))
     }
 
     fn write_coinbase(&self) -> Result<(), String> {
@@ -1201,7 +1193,9 @@ impl FileStore {
                 .map_err(|e| format!("cannot read snapshot.meta: {e}"))?,
         )?;
         if state::StateStore::root(&fs.inner) != meta.state_root {
-            return Err("snapshot state_root mismatch: snapshot is corrupt or untrustworthy".into());
+            return Err(
+                "snapshot state_root mismatch: snapshot is corrupt or untrustworthy".into(),
+            );
         }
         // Checkpoint-bounded trust: a snapshot may only be trusted if its tip is
         // consistent with the highest checkpoint at or below its height. With an
@@ -1221,11 +1215,8 @@ impl FileStore {
     }
 
     fn snapshot_write_state(&self, dir: &Path) -> Result<(), String> {
-        write_utxos(
-            &dir.join("utxo.dat"),
-            &self.inner.utxos,
-        )
-        .map_err(|e| format!("snapshot utxo: {e}"))?;
+        write_utxos(&dir.join("utxo.dat"), &self.inner.utxos)
+            .map_err(|e| format!("snapshot utxo: {e}"))?;
         write_coinbase(&dir.join("coinbase.dat"), &self.inner.coinbase)
             .map_err(|e| format!("snapshot coinbase: {e}"))?;
         write_meta(
@@ -1472,7 +1463,10 @@ mod snapshot_tests {
         let snap = dir.join("snap");
         s.save_snapshot(&snap).unwrap();
         let loaded = FileStore::load_snapshot(&snap, &ChainParams::testnet()).unwrap();
-        assert_eq!(state::StateStore::root(&loaded), state::StateStore::root(&s));
+        assert_eq!(
+            state::StateStore::root(&loaded),
+            state::StateStore::root(&s)
+        );
         assert_eq!(loaded.tip(), Some(tip));
         assert_eq!(loaded.height_of(&tip), Some(100));
         assert!(loaded.get_block(&tip).is_some());
@@ -1552,10 +1546,7 @@ mod snapshot_tests {
             live.set_work(h, i as u128 + 1);
             // Move the UTXO forward to the new output so the snapshot has a live tip.
             live.remove_utxo(&op);
-            let new_op = OutPoint {
-                txid: h,
-                index: 0,
-            };
+            let new_op = OutPoint { txid: h, index: 0 };
             live.add_utxo(
                 new_op.clone(),
                 TxOut {

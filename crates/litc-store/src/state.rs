@@ -51,7 +51,11 @@ fn utxo_leaf_value(entry: &UtxoEntry) -> Vec<u8> {
     b.extend_from_slice(&entry.output.value.0.to_le_bytes());
     b.extend_from_slice(&(entry.output.script_pubkey.len() as u32).to_le_bytes());
     b.extend_from_slice(&entry.output.script_pubkey);
-    b.push(if entry.coinbase_height.is_some() { 1 } else { 0 });
+    b.push(if entry.coinbase_height.is_some() {
+        1
+    } else {
+        0
+    });
     if let Some(h) = entry.coinbase_height {
         b.extend_from_slice(&h.to_le_bytes());
     }
@@ -108,8 +112,10 @@ fn build(leaves: &[([u8; 32], Vec<u8>)], depth: usize) -> [u8; 32] {
 
 /// Canonical, order-independent `state_root` from the consensus state.
 pub(crate) fn state_root_of(utxos: Vec<(OutPoint, UtxoEntry)>) -> [u8; 32] {
-    let mut u: Vec<([u8; 32], Vec<u8>)> =
-        utxos.iter().map(|(op, e)| (utxo_key(op), utxo_leaf_value(e))).collect();
+    let mut u: Vec<([u8; 32], Vec<u8>)> = utxos
+        .iter()
+        .map(|(op, e)| (utxo_key(op), utxo_leaf_value(e)))
+        .collect();
     smt_root(&mut u)
 }
 

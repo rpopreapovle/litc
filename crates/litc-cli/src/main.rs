@@ -20,7 +20,9 @@ use std::thread;
 use bip39::{Language, Mnemonic};
 use litc_keystore::{FileKeyStore, KeyStore};
 use litc_pow::{meets_target, mine, prepare_epoch};
-use litc_primitives::{mldsa, sha256d, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN};
+use litc_primitives::{
+    mldsa, sha256d, to_bytes, Amount, Block, Decodable, Hash32, Reader, Transaction, COIN,
+};
 use litc_store::{FileStore, UtxoStore};
 use litc_wallet::Wallet;
 
@@ -86,14 +88,19 @@ fn write_tx(tx: &Transaction) {
 
 fn cmd_wallet(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: litc wallet <new|restore|address|addresses|balance|history|send|export|debug>");
+        eprintln!(
+            "usage: litc wallet <new|restore|address|addresses|balance|history|send|export|debug>"
+        );
         return;
     }
     match args[0].as_str() {
         "new" => {
             let ks = FileKeyStore::new(datadir().join("wallet.dat"));
             if ks.exists() {
-                eprintln!("wallet already exists at {}", datadir().join("wallet.dat").display());
+                eprintln!(
+                    "wallet already exists at {}",
+                    datadir().join("wallet.dat").display()
+                );
                 return;
             }
             // Generate 256-bit entropy → BIP39 24-word mnemonic → PBKDF2 seed.
@@ -107,8 +114,7 @@ fn cmd_wallet(args: &[String]) {
             println!("mnemonic seed phrase (24 words — write this down!):");
             println!("{}", mnemonic);
             println!();
-            println!("address: {}",
-                w.address_at(0, mldsa::MAINNET_VERSION));
+            println!("address: {}", w.address_at(0, mldsa::MAINNET_VERSION));
         }
         "restore" => {
             if args.len() < 2 {
@@ -117,19 +123,23 @@ fn cmd_wallet(args: &[String]) {
             }
             let ks = FileKeyStore::new(datadir().join("wallet.dat"));
             if ks.exists() {
-                eprintln!("wallet already exists; remove {} first",
-                    datadir().join("wallet.dat").display());
+                eprintln!(
+                    "wallet already exists; remove {} first",
+                    datadir().join("wallet.dat").display()
+                );
                 return;
             }
             let seed = match seed_from_mnemonic(&args[1]) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("{e}"); return; }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return;
+                }
             };
             ks.save_seed(&seed).expect("cannot save keystore");
             let w = Wallet::new(seed);
             println!("restored from mnemonic");
-            println!("address: {}",
-                w.address_at(0, mldsa::MAINNET_VERSION));
+            println!("address: {}", w.address_at(0, mldsa::MAINNET_VERSION));
         }
         "address" => {
             let (w, _ks) = open_wallet();
@@ -164,8 +174,12 @@ fn cmd_wallet(args: &[String]) {
                     }
                 }
             }
-            println!("balance  {} sat ({}.{:08} LIT) in {count} UTXOs",
-                sum, sum / COIN, sum % COIN);
+            println!(
+                "balance  {} sat ({}.{:08} LIT) in {count} UTXOs",
+                sum,
+                sum / COIN,
+                sum % COIN
+            );
         }
         "history" => {
             let (w, _ks) = open_wallet();
@@ -182,10 +196,12 @@ fn cmd_wallet(args: &[String]) {
                     let mut prefix = [0u8; 20];
                     prefix.copy_from_slice(&out.script_pubkey[..20]);
                     if let Some(&idx) = commit_to_idx.get(&prefix) {
-                        println!("  {}  index={idx}  {}.{:08} LIT",
+                        println!(
+                            "  {}  index={idx}  {}.{:08} LIT",
                             op.txid.to_hex(),
                             out.value.0 / COIN,
-                            out.value.0 % COIN);
+                            out.value.0 % COIN
+                        );
                         found_any = true;
                     }
                 }
@@ -228,11 +244,13 @@ fn cmd_wallet(args: &[String]) {
             let seed = ks.load_seed().expect("cannot load keystore");
             // Regenerate mnemonic from seed (not perfectly round-trippable via
             // PBKDF2, so we just show the raw hex seed).
-            println!("seed (hex): {}", seed.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            println!(
+                "seed (hex): {}",
+                seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
             println!();
             let w = Wallet::new(seed);
-            println!("address: {}",
-                w.address_at(0, mldsa::MAINNET_VERSION));
+            println!("address: {}", w.address_at(0, mldsa::MAINNET_VERSION));
         }
         "debug" => {
             let (w, _ks) = open_wallet();
@@ -240,26 +258,45 @@ fn cmd_wallet(args: &[String]) {
             let utxos = store.iter_utxos();
             eprintln!("=== DEBUG: all UTXOs in store ({}) ===", utxos.len());
             for (op, out) in &utxos {
-                eprintln!("  txid={} idx={} val={} script={} script_hex={}",
-                    op.txid.to_hex(), op.index, out.value.0,
+                eprintln!(
+                    "  txid={} idx={} val={} script={} script_hex={}",
+                    op.txid.to_hex(),
+                    op.index,
+                    out.value.0,
                     out.script_pubkey.len(),
-                    out.script_pubkey.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    out.script_pubkey
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                );
             }
             eprintln!("=== wallet commitment at index 0 ===");
             let commit = w.commitment_at(0);
-            eprintln!("  commit_hex={}", commit.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            eprintln!(
+                "  commit_hex={}",
+                commit
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
             eprintln!("  address={}", w.address_at(0, mldsa::MAINNET_VERSION));
             eprintln!("=== scanning ===");
             let mut idx = 0u32;
             loop {
                 let c = w.commitment_at(idx);
                 let found = store.find_by_commit(&c);
-                eprintln!("  idx={idx} commit={} found={}",
+                eprintln!(
+                    "  idx={idx} commit={} found={}",
                     c.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    found.is_some());
-                if found.is_none() { break; }
+                    found.is_some()
+                );
+                if found.is_none() {
+                    break;
+                }
                 idx += 1;
-                if idx > 20 { break; }
+                if idx > 20 {
+                    break;
+                }
             }
         }
         other => eprintln!("unknown wallet subcommand: {other}"),
@@ -281,7 +318,11 @@ fn parse_from(rest: &[String]) -> u32 {
 }
 
 /// Call a JSON-RPC method on a pool node. Returns the result value.
-fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_call(
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -319,24 +360,44 @@ fn cmd_pool_mine(args: &[String]) {
     let mut scratch: Option<litc_pow::Scratch> = None;
     loop {
         // Fetch a fresh block template.
-        let tmpl = match rpc_call(&url, "getblocktemplate", json!([worker])) {
+        let tmpl = match rpc_call(url, "getblocktemplate", json!([worker])) {
             Ok(v) => v,
-            Err(e) => { eprintln!("[pool] {e}"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+            Err(e) => {
+                eprintln!("[pool] {e}");
+                thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
         };
         let block_hex = tmpl["block_hex"].as_str().unwrap_or("");
         let target_hex = tmpl["target_hex"].as_str().unwrap_or("");
         let height = tmpl["height"].as_u64().unwrap_or(0);
         let block_bytes = match hex::decode(block_hex) {
             Ok(b) => b,
-            Err(_) => { eprintln!("[pool] bad block hex"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+            Err(_) => {
+                eprintln!("[pool] bad block hex");
+                thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
         };
         let target = match hex::decode(target_hex) {
-            Ok(b) if b.len() == 32 => { let mut t = [0u8; 32]; t.copy_from_slice(&b); t }
-            _ => { eprintln!("[pool] bad target"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+            Ok(b) if b.len() == 32 => {
+                let mut t = [0u8; 32];
+                t.copy_from_slice(&b);
+                t
+            }
+            _ => {
+                eprintln!("[pool] bad target");
+                thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
         };
         let mut block = match Block::decode(&mut Reader::new(&block_bytes)) {
             Ok(b) => b,
-            Err(_) => { eprintln!("[pool] bad block"); thread::sleep(std::time::Duration::from_secs(5)); continue; }
+            Err(_) => {
+                eprintln!("[pool] bad block");
+                thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
         };
         // Prepare scratchpad once per epoch.
         let epoch_seed = block.header.epoch_seed;
@@ -355,8 +416,11 @@ fn cmd_pool_mine(args: &[String]) {
             let digest = mine(scratch.as_ref().unwrap(), nonce, &challenge);
             if meets_target(&digest, &target) {
                 block.header.nonce = nonce;
-                let submit_hex: String = to_bytes(&block).iter().map(|b| format!("{b:02x}")).collect();
-                match rpc_call(&url, "submitblock", json!([submit_hex, worker])) {
+                let submit_hex: String = to_bytes(&block)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                match rpc_call(url, "submitblock", json!([submit_hex, worker])) {
                     Ok(_) => eprintln!("[pool] block #{height} found! nonce={nonce}"),
                     Err(e) => eprintln!("[pool] submit failed: {e}"),
                 }
@@ -388,6 +452,8 @@ fn main() {
         }
         "wallet" => cmd_wallet(&args[2..]),
         "pool-mine" => cmd_pool_mine(&args[2..]),
-        other => eprintln!("unknown subcommand: {other} (expected `node` | `wallet` | `pool-mine`)"),
+        other => {
+            eprintln!("unknown subcommand: {other} (expected `node` | `wallet` | `pool-mine`)")
+        }
     }
 }
