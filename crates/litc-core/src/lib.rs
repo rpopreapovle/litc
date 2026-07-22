@@ -245,6 +245,9 @@ pub fn validate_block_value<S: StateStore>(
     }
     if let Some(cb) = block.txs.first() {
         if cb.inputs.is_empty() {
+            if cb.outputs.is_empty() {
+                return Err("coinbase has no outputs".into());
+            }
             let out: u64 = cb.outputs.iter().map(|o| o.value.0).sum();
             let max_allowed = block_subsidy_with(block.header.height, halving_interval)
                 .0

@@ -177,21 +177,22 @@ pub(crate) fn write_tx(tx: &Transaction) {
 
 /// True if `addr` is within its sliding-window rate limit for this message
 /// kind (prunes stale timestamps first). Does not record the event.
+/// Rate limiting is per-IP (not per-port) to prevent port-cycling bypass.
 fn peer_rate_allowed(
-    map: &mut HashMap<SocketAddr, Vec<u64>>,
+    map: &mut HashMap<IpAddr, Vec<u64>>,
     addr: &SocketAddr,
     window: u64,
     limit: usize,
 ) -> bool {
     let now = now_secs();
-    let v = map.entry(*addr).or_default();
+    let v = map.entry(addr.ip()).or_default();
     v.retain(|t| now.saturating_sub(*t) < window);
     v.len() < limit
 }
 
 /// Record one accepted message of this kind from `addr`.
-fn peer_rate_record(map: &mut HashMap<SocketAddr, Vec<u64>>, addr: &SocketAddr) {
-    map.entry(*addr).or_default().push(now_secs());
+fn peer_rate_record(map: &mut HashMap<IpAddr, Vec<u64>>, addr: &SocketAddr) {
+    map.entry(addr.ip()).or_default().push(now_secs());
 }
 
 /// Shared node state. `S` is the chain store (in-memory or file-backed).
@@ -201,10 +202,10 @@ pub(crate) struct Node<S: SpendStore + StateStore> {
     pub(crate) known_blocks: HashSet<Hash32>,
     pub(crate) known_txs: HashSet<Hash32>,
     pub(crate) mempool: Vec<Transaction>,
-    /// Per-peer transaction-accept timestamps (for rate limiting).
-    peer_tx: HashMap<SocketAddr, Vec<u64>>,
-    /// Per-peer block-accept timestamps (for rate limiting).
-    peer_block: HashMap<SocketAddr, Vec<u64>>,
+    /// Per-IP transaction-accept timestamps (for rate limiting).
+    peer_tx: HashMap<IpAddr, Vec<u64>>,
+    /// Per-IP block-accept timestamps (for rate limiting).
+    peer_block: HashMap<IpAddr, Vec<u64>>,
     my_nonce: u64,
     /// Best chain tip (Hash32([0u8; 32]) until the first block arrives).
     pub(crate) tip: Hash32,
@@ -520,6 +521,18 @@ type AddrSet = Arc<Mutex<HashSet<SocketAddr>>>;
 /// Maximum number of block hashes returned in one `GetBlocks` response.
 const MAX_SYNC_INV: usize = 2000;
 
+/// Maximum number of inbound peer connections to accept. Prevents a DoS
+/// attacker from exhausting OS threads by opening thousands of connections.
+const MAX_PEERS: usize = 125;
+
+/// Maximum number of addresses to process from a single Addr message.
+/// Limits the work a single peer can force us to do via address gossip.
+const MAX_ADDR_PER_MSG: usize = 20;
+
+/// Handshake timeout in seconds. If a peer doesn't complete the version/verack
+/// exchange within this window the connection is dropped.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
 struct Peer {
     writer: Arc<Mutex<TcpStream>>,
     handshaked: bool,
@@ -715,7 +728,9 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 for it in &items {
                     if it.kind == MSG_BLOCK {
                         if let Some(b) = n.store.get_block(&Hash32(it.hash)) {
-                            out.push(Message::Block(to_bytes(&b)));
+                            if !b.txs.is_empty() {
+                                out.push(Message::Block(to_bytes(&b)));
+                            }
                         }
                     } else if it.kind == MSG_TX {
                         if let Some(tx) = n.mempool.iter().find(|t| t.txid() == Hash32(it.hash)) {
@@ -746,7 +761,10 @@ fn on_message<S: SpendStore + StateStore + Send + 'static>(
                 send_msg(peers, &addr, &codec, &Message::Addr(addrs));
             }
         }
-        Message::Addr(list) => {
+        Message::Addr(mut list) => {
+            if list.len() > MAX_ADDR_PER_MSG {
+                list.truncate(MAX_ADDR_PER_MSG);
+            }
             let mut new_peers = Vec::new();
             {
                 let mut k = known.lock().unwrap();
@@ -838,6 +856,10 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
     listen: SocketAddr,
     connecting: &AddrSet,
 ) {
+    // Set a read timeout so slow/malicious peers that never complete the
+    // handshake cannot hold a thread (and a file descriptor) indefinitely.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)));
+
     let writer = match stream.try_clone() {
         Ok(w) => Arc::new(Mutex::new(w)),
         Err(_) => return,
@@ -870,6 +892,7 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
+    let mut handshake_done = false;
     loop {
         match stream.read(&mut tmp) {
             Ok(0) => break,
@@ -897,6 +920,16 @@ fn handle_conn<S: SpendStore + StateStore + Send + 'static>(
                 Err(e) => {
                     eprintln!("{RED}{BOLD}[p2p]{RESET} {RED}wire error from {addr}: {e}{RESET}");
                     return;
+                }
+            }
+        }
+        // Once the handshake (version + verack) is complete, remove the read
+        // timeout so established peers can stream data without a deadline.
+        if !handshake_done {
+            if let Some(p) = peers.lock().unwrap().get(&addr) {
+                if p.handshaked {
+                    handshake_done = true;
+                    let _ = stream.set_read_timeout(None);
                 }
             }
         }
@@ -1235,6 +1268,12 @@ pub fn run(args: Vec<String>) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            if lpeers.lock().unwrap().len() >= MAX_PEERS {
+                eprintln!(
+                    "{RED}{BOLD}[p2p]{RESET} {RED}rejecting inbound {addr} — at peer limit ({MAX_PEERS}){RESET}"
+                );
+                continue;
+            }
             let p = lpeers.clone();
             let nd = lnode.clone();
             let kn = lknown.clone();
