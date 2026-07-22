@@ -70,24 +70,23 @@ Under `$LITC_DATADIR`:
 | `chain.dat` | Append-only block records |
 | `chain.idx` | Block index for seeking |
 | `utxo.dat` | Live UTXO set |
-| `burnt.dat` | Spent-stealth commitment index |
 | `tip.dat` | Current best-block hash |
 | `mempool/*.tx` | Pending signed transactions |
 
 ## Wallet
 
 ```bash
-# Create wallet and print stealth address.
+# Create wallet and print ML-DSA-2 address.
 cargo run -p litc-cli -- wallet new
-
-# Scan chain for received stealth outputs (coinbase, payments).
-cargo run -p litc-cli -- wallet scan
 
 # Check balance.
 cargo run -p litc-cli -- wallet balance
 
+# Show receiving address.
+cargo run -p litc-cli -- wallet address
+
 # Send coins.
-cargo run -p litc-cli -- wallet send-stealth <stealth-addr> <amount>
+cargo run -p litc-cli -- wallet send <address> <amount>
 ```
 
 Or use the JSON-RPC API (see [rpc.md](rpc.md)).

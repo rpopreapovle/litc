@@ -73,29 +73,25 @@ EPOCH_BLOCKS = 2400       (~10 h at 15 s)
 fill         = sequential SHA-256d chain: lane[i] = SHA-256d(SHA-256d(lane[i-1]) || seed)
 ```
 
-## WOTS+ signature sizing & throughput (post-quantum, one-time sigs)
+## ML-DSA-2 signature sizing & throughput (post-quantum, reusable sigs)
 
-LiTC spends UTXOs with WOTS+ (see [wots.md](wots.md)). Parameters are fixed at
-`W = 256`, `N = 32`, `L1 = 32`, `L2 = 2`, so `L = 34` hash chains. With
-`W = 256` every message byte is exactly one chain digit, so signing/verifying
-a chain runs `digit .. W-1` hash iterations with an average of `(W-1)/2 ≈ 127`
-SHA-256d steps per chain.
+LiTC spends UTXOs with ML-DSA-2 (Dilithium, NIST FIPS 204, security level 2).
+See `litc-primitives::mldsa`.
 
 ### Witness size (on-chain cost)
 ```
-witness = pk_seed (32) + r (32) + sig (L * N = 34 * 32 = 1088)  = 1152 bytes
+witness = public_key (1312) + signature (~2420)  = ~3732 bytes per input
 ```
-That 1152-byte witness is the per-input spending cost and is what fast-sync
-snapshots and the SMT state root must carry. It is fixed by `W = 256`, not by
-key count, so a single-input transaction is ~1152 B of witness regardless of
-address reuse (addresses are one-time anyway).
+The public key is revealed at spend time; the UTXO script commits to
+`HASH160(pk)` (20 bytes). ML-DSA-2 keys are reusable — no one-time limit.
 
-### Throughput (measured, debug build, Xeon-class CPU)
+### Throughput (measured, release build, Xeon-class CPU)
 | Step | Result |
 |------|--------|
-| witness bytes | 1152 |
-| `sign`   | ~30 ms ≈ 33 sig/s |
-| `verify` | ~312 ms ≈ 3 ver/s |
+| public key | 1312 bytes |
+| signature | ~2420 bytes |
+| `sign`   | ~2 ms |
+| `verify` | ~1 ms |
 
 > Debug numbers; a release build is several times faster. The dominant cost is
 > the `W-1 = 255` upper-bound chain length, so `verify` (~34×255 hashes) is ~10x

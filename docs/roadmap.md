@@ -64,8 +64,9 @@ Complete `docs/`; `cargo build --locked` yields deterministic releases.
 
 Delivered binaries and libraries live in `docs/cli.md` (the `litc` client and
 `litc-node` daemon) and `docs/ffi.md` (the `litc-ffi` C-ABI library usable from
-any FFI-capable language). The reusable stealth-address scheme is documented in
-`docs/stealth.md`; the WOTS+ reuse strategy in `docs/wots.md`.
+any FFI-capable language). The ML-DSA-2 signature scheme is documented in
+`litc-primitives::mldsa`. Historical WOTS+/stealth docs are archived in
+`docs/wots.md` and `docs/stealth.md`.
 
 ## Definition of Done (MVP testnet)
 - `cargo build --locked` works without GPU deps; `--features gpu` adds wgpu GPU miner.
@@ -129,21 +130,5 @@ Pre-mainnet breaking change. See [ml-dsa-migration.md](ml-dsa-migration.md).
 simpler wallet (no stealth scan, no KEM, no burnt keys). Same
 post-quantum security class (module-LWE/SIS, FIPS 204).
 
-### Phase 1 — Add ML-DSA-2 alongside WOTS+
-1. Add `pqcrypto-dilithium` crate to `litc-primitives`.
-2. Create `mldsa.rs`: keygen, sign, verify, address encoding.
-3. Add `Mldsa2 = 1` to `SignatureScheme` enum.
-4. Unit tests: roundtrip, address format, sighash binding.
-5. `validate_tx` recognizes but rejects `Mldsa2` (inactive).
-
-### Phase 2 — Fork activation
-1. Activate `Mldsa2` at a specific testnet block height.
-2. `Wots256` becomes invalid for new transactions at fork height.
-3. Existing WOTS+ UTXOs remain spendable (migration window).
-4. `litc-cli wallet new` defaults to ML-DSA-2.
-5. `litc-cli wallet send` uses ML-DSA-2 signatures.
-
-### Phase 3 — Prune legacy
-1. After migration window (~1000 blocks), reject new WOTS+ spends.
-2. Remove WOTS+ verification from `validate_tx`.
-3. Archive `wots.md`, `stealth.md`.
+All WOTS+, KEM, stealth, and burnt-keys code has been removed from the
+codebase. The migration was a direct replacement (no network was live).
