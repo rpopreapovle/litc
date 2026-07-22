@@ -90,12 +90,18 @@ impl MinerBackend for CpuMiner {
 /// Build the candidate block from a template without mining (nonce = 0). Used
 /// by the node to compute the template's `state_root` before mining.
 pub fn assemble_block(t: &BlockTemplate) -> Block {
+    // Coinbase script = commitment (20 bytes) || height (8 bytes LE).
+    // The height suffix makes each coinbase output unique, so each block
+    // produces a different txid even when paying the same address.
+    let mut coinbase_script = Vec::with_capacity(28);
+    coinbase_script.extend_from_slice(&t.coinbase_script);
+    coinbase_script.extend_from_slice(&t.height.to_le_bytes());
     let coinbase = Transaction {
         version: 1,
         inputs: vec![],
         outputs: vec![TxOut {
             value: t.coinbase_value,
-            script_pubkey: t.coinbase_script.clone(),
+            script_pubkey: coinbase_script,
         }],
         lock_time: 0,
     };

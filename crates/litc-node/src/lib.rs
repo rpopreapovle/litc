@@ -307,13 +307,14 @@ impl<S: SpendStore + StateStore> Node<S> {
             txs,
             state_root: Hash32([0u8; 32]),
         };
-        // Compute the post-state root for the candidate block and bind it into
-        // the template, so the PoW secures the resulting state (see
-        // `docs/state.md`). Bootstrapping nodes verify it trustlessly.
-        let candidate = assemble_block(&template);
-        let root = block_state_root(&mut self.store, &candidate)
-            .expect("template should apply to current state");
-        template.state_root = Hash32(root);
+        // Genesis block (height 0) has state_root=0 (not committed yet).
+        // For all other blocks, compute the post-state root and bind it.
+        if height > 0 {
+            let candidate = assemble_block(&template);
+            let root = block_state_root(&mut self.store, &candidate)
+                .expect("template should apply to current state");
+            template.state_root = Hash32(root);
+        }
         (template, target)
     }
 

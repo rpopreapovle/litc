@@ -323,7 +323,7 @@ impl UtxoStore for MemoryStore {
     }
     fn find_by_commit(&self, commit: &[u8; 20]) -> Option<OutPoint> {
         for (op, out) in &self.utxos {
-            if out.script_pubkey.len() == 20 && &out.script_pubkey[..20] == commit {
+            if out.script_pubkey.len() >= 20 && &out.script_pubkey[..20] == commit {
                 return Some(op.clone());
             }
         }

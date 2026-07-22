@@ -86,7 +86,7 @@ fn write_tx(tx: &Transaction) {
 
 fn cmd_wallet(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: litc wallet <new|restore|address|addresses|balance|history|send|export>");
+        eprintln!("usage: litc wallet <new|restore|address|addresses|balance|history|send|export|debug>");
         return;
     }
     match args[0].as_str() {
@@ -260,6 +260,34 @@ fn cmd_wallet(args: &[String]) {
             let w = Wallet::new(seed);
             println!("address: {}",
                 w.address_at(0, mldsa::MAINNET_VERSION));
+        }
+        "debug" => {
+            let (w, _ks) = open_wallet();
+            let store = open_store();
+            let utxos = store.iter_utxos();
+            eprintln!("=== DEBUG: all UTXOs in store ({}) ===", utxos.len());
+            for (op, out) in &utxos {
+                eprintln!("  txid={} idx={} val={} script={} script_hex={}",
+                    op.txid.to_hex(), op.index, out.value.0,
+                    out.script_pubkey.len(),
+                    out.script_pubkey.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            }
+            eprintln!("=== wallet commitment at index 0 ===");
+            let commit = w.commitment_at(0);
+            eprintln!("  commit_hex={}", commit.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            eprintln!("  address={}", w.address_at(0, mldsa::MAINNET_VERSION));
+            eprintln!("=== scanning ===");
+            let mut idx = 0u32;
+            loop {
+                let c = w.commitment_at(idx);
+                let found = store.find_by_commit(&c);
+                eprintln!("  idx={idx} commit={} found={}",
+                    c.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    found.is_some());
+                if found.is_none() { break; }
+                idx += 1;
+                if idx > 20 { break; }
+            }
         }
         other => eprintln!("unknown wallet subcommand: {other}"),
     }
