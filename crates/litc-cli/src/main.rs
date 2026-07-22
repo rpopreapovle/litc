@@ -146,34 +146,17 @@ fn cmd_wallet(args: &[String]) {
         "balance" => {
             let (w, _ks) = open_wallet();
             let store = open_store();
+            let utxos = store.iter_utxos();
             let mut sum: u64 = 0;
             let mut count = 0u64;
-            let mut idx = 0u32;
-            loop {
-                let commit = w.commitment_at(idx);
-                if let Some(op) = store.find_by_commit(&commit) {
-                    if let Some(out) = store.utxo(&op) {
+            for (_op, out) in &utxos {
+                for idx in 0..=200u32 {
+                    let commit = w.commitment_at(idx);
+                    if out.script_pubkey.len() >= 20 && &out.script_pubkey[..20] == commit {
                         sum += out.value.0;
                         count += 1;
+                        break;
                     }
-                    idx += 1;
-                } else {
-                    // gap limit: check next 20 addresses
-                    let mut found_more = false;
-                    for gap in 1..=20u32 {
-                        if let Some(op2) = store.find_by_commit(&w.commitment_at(idx + gap)) {
-                            if let Some(out2) = store.utxo(&op2) {
-                                sum += out2.value.0;
-                                count += 1;
-                            }
-                            found_more = true;
-                        }
-                    }
-                    if found_more {
-                        idx += 1;
-                        continue;
-                    }
-                    break;
                 }
             }
             println!("balance  {} sat ({}.{:08} LIT) in {count} UTXOs",

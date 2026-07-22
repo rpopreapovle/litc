@@ -192,7 +192,7 @@ impl<'a, S: StateStore> OverlayState<'a, S> {
     fn merged(&self) -> Vec<(OutPoint, UtxoEntry)> {
         let mut utxos: Vec<(OutPoint, UtxoEntry)> = Vec::new();
         for (op, e) in self.base.iter_utxos() {
-            if !self.removes.contains(&op) {
+            if !self.removes.contains(&op) && !self.puts.contains_key(&op) {
                 utxos.push((op, e));
             }
         }

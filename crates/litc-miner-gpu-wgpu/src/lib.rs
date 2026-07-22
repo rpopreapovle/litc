@@ -284,12 +284,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         fn assemble(&self, t: &BlockTemplate, nonce: u64) -> Block {
+            let mut coinbase_script = Vec::with_capacity(28);
+            coinbase_script.extend_from_slice(&t.coinbase_script);
+            coinbase_script.extend_from_slice(&t.height.to_le_bytes());
             let coinbase = Transaction {
                 version: 1,
                 inputs: vec![],
                 outputs: vec![TxOut {
                     value: t.coinbase_value,
-                    script_pubkey: t.coinbase_script.clone(),
+                    script_pubkey: coinbase_script,
                 }],
                 lock_time: 0,
             };
