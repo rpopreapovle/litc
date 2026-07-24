@@ -1,9 +1,59 @@
 use eframe::egui;
-use litc_primitives::{sha256d, Decodable, Hash32, Reader};
+use litc_primitives::{sha256d, Decodable, Reader};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Persisted GUI settings (saved to gui-config.json next to the binary).
+#[derive(Clone, Serialize, Deserialize)]
+struct GuiConfig {
+    rpc_url: String,
+    pool_url: String,
+    pool_address: String,
+    pool_label: String,
+    pool_min_payout: String,
+    pool_session_token: String,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        GuiConfig {
+            rpc_url: "http://127.0.0.1:18334".into(),
+            pool_url: "http://127.0.0.1:18335".into(),
+            pool_address: String::new(),
+            pool_label: "gui-miner".into(),
+            pool_min_payout: String::new(),
+            pool_session_token: String::new(),
+        }
+    }
+}
+
+fn gui_config_path() -> std::path::PathBuf {
+    std::env::var("LITC_DATADIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("data"))
+        .join("gui-config.json")
+}
+
+fn save_config(cfg: &GuiConfig) {
+    if let Ok(s) = serde_json::to_string_pretty(cfg) {
+        let path = gui_config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, &s);
+    }
+}
+
+fn load_config() -> GuiConfig {
+    let path = gui_config_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Default)]
 struct NodeInfo {
@@ -199,7 +249,7 @@ fn pool_mine_loop(url: &str, worker: &str, payout_addr: &str, running: Arc<Atomi
 }
 
 struct LiTCGui {
-    rpc_url: String,
+    config: GuiConfig,
     tab: Tab,
     state: Arc<Mutex<AppState>>,
     poll_count: u64,
@@ -212,32 +262,35 @@ struct LiTCGui {
     send_amount: String,
     send_status: String,
 
-    // Pool mining (legacy)
-    pool_url: String,
-    pool_worker: String,
-    pool_payout_addr: String,
-    pool_running: Arc<AtomicBool>,
+    // Pool
+    pool_mining_running: Arc<AtomicBool>,
+    pool_connected: bool,
     pool_status: String,
-
-    // Smart pool (registration-based)
-    pool_register_addr: String,
-    pool_label: String,
-    pool_min_payout: String,
-    pool_session_token: String,
-    pool_registered: bool,
     pool_balance_sat: u64,
     pool_balance_fmt: String,
     pool_blocks_found: u64,
-    pool_total_earned: u64,
     pool_total_earned_fmt: String,
-    pool_sse_url: String,
     pool_events: Vec<String>,
+    pool_register_in_progress: bool,
+}
+
+impl LiTCGui {
+    fn save(&self) {
+        save_config(&self.config);
+    }
+    fn load() -> Self {
+        let cfg = load_config();
+        let mut s = Self::default();
+        s.config = cfg;
+        s
+    }
 }
 
 impl Default for LiTCGui {
     fn default() -> Self {
+        let cfg = GuiConfig::default();
         Self {
-            rpc_url: "http://127.0.0.1:18334".into(),
+            config: cfg,
             tab: Tab::Node,
             state: Arc::new(Mutex::new(AppState::default())),
             poll_count: 0,
@@ -245,41 +298,125 @@ impl Default for LiTCGui {
             send_to: String::new(),
             send_amount: String::new(),
             send_status: String::new(),
-            pool_url: "http://127.0.0.1:18335".into(),
-            pool_worker: "gui-miner".into(),
-            pool_payout_addr: String::new(),
-            pool_running: Arc::new(AtomicBool::new(false)),
+            pool_mining_running: Arc::new(AtomicBool::new(false)),
+            pool_connected: false,
             pool_status: String::new(),
-            pool_register_addr: String::new(),
-            pool_label: "gui-miner".into(),
-            pool_min_payout: "".into(),
-            pool_session_token: String::new(),
-            pool_registered: false,
             pool_balance_sat: 0,
             pool_balance_fmt: "0.00000000 LIT".into(),
             pool_blocks_found: 0,
-            pool_total_earned: 0,
             pool_total_earned_fmt: "0.00000000 LIT".into(),
-            pool_sse_url: String::new(),
             pool_events: Vec::new(),
+            pool_register_in_progress: false,
         }
     }
 }
 
 impl Drop for LiTCGui {
     fn drop(&mut self) {
-        self.pool_running.store(false, Ordering::Relaxed);
+        self.pool_mining_running.store(false, Ordering::Relaxed);
+        self.save();
         if let Some(mut p) = self.node_process.take() {
             let _ = p.kill();
         }
     }
 }
 
+/// Poll pool balance in the background when connected.
+fn poll_pool_balance(config: &GuiConfig, connected: &Arc<Mutex<bool>>, balance_sat: &Arc<Mutex<u64>>, balance_fmt: &Arc<Mutex<String>>, blocks: &Arc<Mutex<u64>>, earned: &Arc<Mutex<String>>) {
+    if config.pool_session_token.is_empty() { return; }
+    let token = config.pool_session_token.clone();
+    let url = config.pool_url.clone();
+    let c = connected.clone();
+    let bs = balance_sat.clone();
+    let bf = balance_fmt.clone();
+    let bl = blocks.clone();
+    let er = earned.clone();
+    std::thread::spawn(move || {
+        match rpc_call(&url, "pool_balance", json!([token])) {
+            Ok(v) => {
+                if !*c.lock().unwrap() { return; }
+                *bs.lock().unwrap() = v["balance_sat"].as_u64().unwrap_or(0);
+                *bf.lock().unwrap() = v["balance_formatted"].as_str().unwrap_or("0 LIT").to_string();
+                *bl.lock().unwrap() = v["blocks_found"].as_u64().unwrap_or(0);
+                *er.lock().unwrap() = v["total_earned_formatted"].as_str().unwrap_or("0 LIT").to_string();
+            }
+            Err(_) => {
+                // Session expired — clear connection.
+                *c.lock().unwrap() = false;
+            }
+        }
+    });
+}
+
+/// Auto-register with the pool. Saves session token to gui-config.json on success.
+fn auto_register(admin_url: &str, pool_url: &str, address: &str, label: &str, min_payout: &str, _token: &str) {
+    if address.is_empty() { return; }
+    let admin_url = admin_url.to_string();
+    let pool_url = pool_url.to_string();
+    let address = address.to_string();
+    let label = label.to_string();
+    let min_payout = min_payout.to_string();
+
+    std::thread::spawn(move || {
+        let payload = format!("pool-register:{}:{}", address, min_payout);
+        let msg_hash = sha256d(payload.as_bytes());
+        let msg_hex = hex::encode(msg_hash.0);
+
+        match rpc_call(&admin_url, "signmessage", json!([0, msg_hex])) {
+            Ok(sig_resp) => {
+                let pk = sig_resp["pubkey_hex"].as_str().unwrap_or("").to_string();
+                let sig = sig_resp["signature_hex"].as_str().unwrap_or("").to_string();
+                match rpc_call(&pool_url, "pool_register", json!([address, pk, sig, min_payout, label])) {
+                    Ok(reg) => {
+                        if let Some(token) = reg["session_token"].as_str() {
+                            let mut cfg = load_config();
+                            cfg.pool_session_token = token.to_string();
+                            cfg.pool_url = pool_url;
+                            cfg.pool_address = address;
+                            cfg.pool_label = label;
+                            cfg.pool_min_payout = min_payout;
+                            save_config(&cfg);
+                            eprintln!("[pool] registered, session={token}");
+                        }
+                    }
+                    Err(e) => eprintln!("[pool] register failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[pool] signmessage failed: {e}"),
+        }
+    });
+}
+
 impl eframe::App for LiTCGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_count += 1;
         if self.poll_count % 4 == 0 {
-            poll_background(&self.state, &self.rpc_url);
+            poll_background(&self.state, &self.config.rpc_url);
+        }
+        // If registration was started, check if token was saved.
+        if self.pool_register_in_progress {
+            let cfg = load_config();
+            if !cfg.pool_session_token.is_empty() {
+                self.config.pool_session_token = cfg.pool_session_token.clone();
+                self.pool_connected = true;
+                self.pool_register_in_progress = false;
+                self.pool_status = "Connected.".into();
+            }
+        }
+
+        // Poll pool balance every ~2 seconds when connected.
+        if self.poll_count % 4 == 0 && self.pool_connected && !self.config.pool_session_token.is_empty() {
+            let bs = Arc::new(Mutex::new(self.pool_balance_sat));
+            let bf = Arc::new(Mutex::new(self.pool_balance_fmt.clone()));
+            let bl = Arc::new(Mutex::new(self.pool_blocks_found));
+            let er = Arc::new(Mutex::new(self.pool_total_earned_fmt.clone()));
+            let cn = Arc::new(Mutex::new(self.pool_connected));
+            poll_pool_balance(&self.config, &cn, &bs, &bf, &bl, &er);
+            self.pool_balance_sat = *bs.lock().unwrap();
+            self.pool_balance_fmt = bf.lock().unwrap().clone();
+            self.pool_blocks_found = *bl.lock().unwrap();
+            self.pool_total_earned_fmt = er.lock().unwrap().clone();
+            self.pool_connected = *cn.lock().unwrap();
         }
 
         let state = self.state.lock().unwrap().clone();
@@ -296,7 +433,7 @@ impl eframe::App for LiTCGui {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.horizontal(|ui| {
                         ui.label("RPC:");
-                        let resp = ui.add(egui::TextEdit::singleline(&mut self.rpc_url).desired_width(200.0));
+                        let resp = ui.add(egui::TextEdit::singleline(&mut self.config.rpc_url).desired_width(200.0));
                         if resp.changed() { self.poll_count = 0; }
                     });
                 });
@@ -391,6 +528,7 @@ impl LiTCGui {
         ui.heading("Miner");
         ui.separator();
 
+        // ── Local Mining ──
         ui.heading("Local Mining");
         ui.label("Майнит в кошелёк ноды (ваш баланс).");
         if state.node_info.is_some() {
@@ -398,12 +536,12 @@ impl LiTCGui {
                 let enabled = state.mining_enabled;
                 if enabled {
                     if ui.button("Stop Mining").clicked() {
-                        let url = self.rpc_url.clone();
+                        let url = self.config.rpc_url.clone();
                         std::thread::spawn(move || { let _ = rpc_setmining(&url, false); });
                     }
                 } else {
                     if ui.button("Start Mining").clicked() {
-                        let url = self.rpc_url.clone();
+                        let url = self.config.rpc_url.clone();
                         std::thread::spawn(move || { let _ = rpc_setmining(&url, true); });
                     }
                 }
@@ -420,89 +558,114 @@ impl LiTCGui {
 
         ui.add_space(16.0);
         ui.separator();
-        ui.label("Smart Pool — регистрация через ML-DSA-2. Баланс и выплаты внутри пула.");
 
-        // ── Registration section ──
-        ui.heading("Pool Registration");
+        // ── Smart Pool — настройки подключения ──
+        ui.heading("Pool Connection");
+        ui.label("Настройки сохраняются автоматически. При подключении — авторегистрация через ML-DSA-2.");
+
         ui.horizontal(|ui| {
             ui.label("Pool URL:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_url).desired_width(250.0));
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.config.pool_url).desired_width(250.0));
+            if resp.changed() { self.save(); }
         });
         ui.horizontal(|ui| {
             ui.label("Your Address:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_register_addr).desired_width(280.0).hint_text("litc1q..."));
-            if ui.button("Paste from Wallet").clicked() {
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.config.pool_address).desired_width(280.0).hint_text("litc1q..."));
+            if resp.changed() { self.save(); }
+            if ui.button("Paste").clicked() {
                 if let Some(ref info) = state.wallet_info {
-                    self.pool_register_addr = info.address.clone();
+                    self.config.pool_address = info.address.clone();
+                    self.save();
                 }
             }
         });
         ui.horizontal(|ui| {
             ui.label("Worker Label:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_label).desired_width(150.0));
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.config.pool_label).desired_width(150.0));
+            if resp.changed() { self.save(); }
         });
         ui.horizontal(|ui| {
-            ui.label("Min Auto-Payout:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_min_payout).desired_width(100.0).hint_text("0.1 LIT"));
+            ui.label("Min Payout:");
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.config.pool_min_payout).desired_width(100.0).hint_text("0.1 LIT"));
+            if resp.changed() { self.save(); }
         });
-        ui.horizontal(|ui| {
-            if ui.button("Register with Pool").clicked() {
-                let url = self.pool_url.trim().to_string();
-                let address = self.pool_register_addr.trim().to_string();
-                let label = self.pool_label.trim().to_string();
-                let min_payout = self.pool_min_payout.trim().to_string();
-                let admin_url = self.rpc_url.clone();
-                if address.is_empty() {
-                    self.pool_status = "Enter your LIT address.".into();
-                } else {
-                    self.pool_status = "Registering...".into();
-                    std::thread::spawn(move || {
-                        // Build registration message: sha256("pool-register:<address>:<min_payout>")
-                        let payload = format!("pool-register:{}:{}", address, min_payout);
-                        let msg_hash = litc_primitives::sha256d(payload.as_bytes());
-                        let msg_hex = hex::encode(msg_hash.0);
 
-                        // Sign with wallet index 0 on admin RPC.
-                        match rpc_call(&admin_url, "signmessage", json!([0, msg_hex])) {
-                            Ok(sig_resp) => {
-                                let pk = sig_resp["pubkey_hex"].as_str().unwrap_or("");
-                                let sig = sig_resp["signature_hex"].as_str().unwrap_or("");
-                                // Register on the pool.
-                                match rpc_call(&url, "pool_register", json!([address, pk, sig, min_payout, label])) {
-                                    Ok(reg) => {
-                                        let token = reg["session_token"].as_str().unwrap_or("");
-                                        let fee = reg["fee_pct"].as_f64().unwrap_or(0.0);
-                                        eprintln!("[pool] registered! session={token} fee={fee}%");
-                                    }
-                                    Err(e) => eprintln!("[pool] register failed: {e}"),
+        // ── Connect / Disconnect ──
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if self.pool_connected {
+                if ui.button("Disconnect").clicked() {
+                    self.pool_mining_running.store(false, Ordering::Relaxed);
+                    self.pool_connected = false;
+                    self.config.pool_session_token.clear();
+                    self.pool_status = "Disconnected.".into();
+                    self.save();
+                }
+                ui.colored_label(egui::Color32::GREEN, "● Connected");
+            } else {
+                if ui.button("Connect to Pool").clicked() {
+                    let url = self.config.pool_url.trim().to_string();
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        self.pool_status = "Invalid pool URL".into();
+                    } else if self.config.pool_address.is_empty() {
+                        self.pool_status = "Enter your LIT address first.".into();
+                    } else {
+                        self.save();
+                        self.pool_register_in_progress = true;
+                        self.pool_status = "Connecting...".into();
+
+                        let admin_url = self.config.rpc_url.clone();
+                        let pool_url = url.clone();
+                        let address = self.config.pool_address.clone();
+                        let label = self.config.pool_label.clone();
+                        let min_payout = self.config.pool_min_payout.clone();
+                        let existing_token = self.config.pool_session_token.clone();
+
+                        // Try existing session; if it fails, auto-register.
+                        std::thread::spawn(move || {
+                            // Check existing session first.
+                            if !existing_token.is_empty() {
+                                if let Ok(v) = rpc_call(&pool_url, "pool_balance", json!([existing_token])) {
+                                    let bal = v["balance_formatted"].as_str().unwrap_or("0 LIT");
+                                    eprintln!("[pool] reconnected, balance={bal}");
+                                    return; // session still valid
                                 }
                             }
-                            Err(e) => eprintln!("[pool] signmessage failed: {e}"),
-                        }
-                    });
+                            // Auto-register.
+                            auto_register(&admin_url, &pool_url, &address, &label, &min_payout, &existing_token.clone());
+                        });
+                    }
                 }
-            }
-            if self.pool_registered {
-                ui.colored_label(egui::Color32::GREEN, "● Registered");
+                if self.pool_register_in_progress {
+                    ui.label("⏳");
+                }
+                ui.colored_label(egui::Color32::GRAY, "○ Disconnected");
             }
         });
 
-        // ── Balance / Session info (after registration) ──
-        if self.pool_registered && !self.pool_session_token.is_empty() {
+        // ── Status when connected ──
+        if self.pool_connected && !self.config.pool_session_token.is_empty() {
             ui.add_space(8.0);
             ui.separator();
-            ui.heading("Pool Balance");
-            egui::Grid::new("pool_balance").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Session:"); ui.monospace(&self.pool_session_token[..16]); ui.end_row();
-                ui.label("Balance:"); ui.monospace(&self.pool_balance_fmt); ui.end_row();
-                ui.label("Blocks Found:"); ui.label(format!("{}", self.pool_blocks_found)); ui.end_row();
-                ui.label("Total Earned:"); ui.monospace(&self.pool_total_earned_fmt); ui.end_row();
+            ui.heading("Pool Status");
+            egui::Grid::new("pool_status_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                ui.label("Session:");
+                ui.monospace(&self.config.pool_session_token[..16.min(self.config.pool_session_token.len())]);
+                ui.end_row();
+                ui.label("Balance:");
+                ui.monospace(&self.pool_balance_fmt);
+                ui.end_row();
+                ui.label("Blocks Found:");
+                ui.label(format!("{}", self.pool_blocks_found));
+                ui.end_row();
+                ui.label("Total Earned:");
+                ui.monospace(&self.pool_total_earned_fmt);
+                ui.end_row();
             });
-
             ui.horizontal(|ui| {
-                if ui.button("Refresh Balance").clicked() {
-                    let url = self.pool_url.clone();
-                    let token = self.pool_session_token.clone();
+                if ui.button("Refresh").clicked() {
+                    let url = self.config.pool_url.clone();
+                    let token = self.config.pool_session_token.clone();
                     std::thread::spawn(move || {
                         match rpc_call(&url, "pool_balance", json!([token])) {
                             Ok(v) => eprintln!("[pool] balance={}", v["balance_formatted"].as_str().unwrap_or("?")),
@@ -511,25 +674,23 @@ impl LiTCGui {
                     });
                 }
                 if ui.button("Withdraw All").clicked() {
-                    let url = self.pool_url.clone();
-                    let token = self.pool_session_token.clone();
-                    let admin_url = self.rpc_url.clone();
+                    let url = self.config.rpc_url.clone();
+                    let token = self.config.pool_session_token.clone();
                     std::thread::spawn(move || {
-                        // Withdraw via admin RPC (pool_balance needs wallet access).
-                        // pool_withdraw is an admin RPC (needs wallet seed).
-                        match rpc_call(&admin_url, "pool_withdraw", json!([token, ""])) {
-                            Ok(v) => eprintln!("[pool] withdrawn: {} txid={}", v["amount_formatted"].as_str().unwrap_or("?"), v["txid"].as_str().unwrap_or("?")),
+                        match rpc_call(&url, "pool_withdraw", json!([token, ""])) {
+                            Ok(v) => eprintln!("[pool] withdrawn: {} txid={}",
+                                v["amount_formatted"].as_str().unwrap_or("?"),
+                                v["txid"].as_str().unwrap_or("?")),
                             Err(e) => eprintln!("[pool] withdraw failed: {e}"),
                         }
                     });
                 }
             });
-
-            // ── Events ──
+            // Events
             if !self.pool_events.is_empty() {
                 ui.add_space(4.0);
                 ui.separator();
-                ui.heading("Events");
+                ui.label("Events");
                 egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
                     for ev in &self.pool_events {
                         ui.monospace(ev);
@@ -538,62 +699,9 @@ impl LiTCGui {
             }
         }
 
-        // ── Legacy pool mining (fallback) ──
-        ui.add_space(16.0);
-        ui.separator();
-        ui.label("Legacy Pool Mining (без регистрации)");
-        ui.horizontal(|ui| {
-            ui.label("Worker:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_worker).desired_width(150.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Payout Address:");
-            ui.add(egui::TextEdit::singleline(&mut self.pool_payout_addr).desired_width(280.0).hint_text("litc1q... (опционально)"));
-        });
-        ui.horizontal(|ui| {
-            let running = self.pool_running.load(Ordering::Relaxed);
-            if running {
-                if ui.button("Stop Legacy Mining").clicked() {
-                    self.pool_running.store(false, Ordering::Relaxed);
-                    self.pool_status = "Pool mining stopped.".into();
-                }
-                ui.colored_label(egui::Color32::GREEN, "● Mining (legacy)");
-            } else {
-                if ui.button("Start Legacy Mining").clicked() {
-                    let url = self.pool_url.trim().to_string();
-                    if !url.starts_with("http://") && !url.starts_with("https://") {
-                        self.pool_status = "Invalid pool URL".into();
-                    } else {
-                        self.pool_running.store(true, Ordering::Relaxed);
-                        self.pool_status = "Legacy mining started.".into();
-                        let payout = self.pool_payout_addr.trim().to_string();
-                        pool_mine_loop(&url, &self.pool_worker, &payout, self.pool_running.clone());
-                    }
-                }
-                ui.colored_label(egui::Color32::GRAY, "○ Not mining");
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("Pool Payout (admin, all workers)").clicked() {
-                let url = self.rpc_url.clone();
-                let specific = String::new();
-                std::thread::spawn(move || {
-                    match rpc_call(&url, "pool_payout", json!([specific])) {
-                        Ok(v) => {
-                            let total = v["total_paid_formatted"].as_str().unwrap_or("0 LIT");
-                            eprintln!("[gui] pool payout done: {total}");
-                        }
-                        Err(e) => eprintln!("[gui] pool payout failed: {e}"),
-                    }
-                });
-                self.pool_status = "Pool payout requested.".into();
-            }
-            ui.label("Выплатить всем воркерам (admin RPC).");
-        });
+        // ── Status message ──
         if !self.pool_status.is_empty() {
+            ui.add_space(4.0);
             ui.label(&self.pool_status);
         }
     }
@@ -631,7 +739,7 @@ impl LiTCGui {
                 if self.send_to.is_empty() || self.send_amount.is_empty() {
                     self.send_status = "Fill in recipient and amount.".into();
                 } else {
-                    let url = self.rpc_url.clone();
+                    let url = self.config.rpc_url.clone();
                     let to = self.send_to.clone();
                     let amt = self.send_amount.clone();
                     std::thread::spawn(move || {
@@ -670,7 +778,8 @@ pub fn run(_args: Vec<String>) {
         viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 480.0]),
         ..Default::default()
     };
-    if let Err(e) = eframe::run_native("LiTC GUI", options, Box::new(|_cc| Box::new(LiTCGui::default()))) {
+    let app = LiTCGui::load();
+    if let Err(e) = eframe::run_native("LiTC GUI", options, Box::new(|_cc| Box::new(app))) {
         eprintln!("GUI error: {e}");
     }
 }

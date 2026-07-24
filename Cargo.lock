@@ -2035,6 +2035,7 @@ dependencies = [
  "litc-keystore",
  "litc-pow",
  "litc-primitives",
+ "serde",
  "serde_json",
  "ureq",
 ]
