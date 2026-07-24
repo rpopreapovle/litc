@@ -1,5 +1,5 @@
 use eframe::egui;
-use litc_primitives::{Decodable, Reader};
+use litc_primitives::{sha256d, Decodable, Hash32, Reader};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -212,12 +212,26 @@ struct LiTCGui {
     send_amount: String,
     send_status: String,
 
-    // Pool mining
+    // Pool mining (legacy)
     pool_url: String,
     pool_worker: String,
     pool_payout_addr: String,
     pool_running: Arc<AtomicBool>,
     pool_status: String,
+
+    // Smart pool (registration-based)
+    pool_register_addr: String,
+    pool_label: String,
+    pool_min_payout: String,
+    pool_session_token: String,
+    pool_registered: bool,
+    pool_balance_sat: u64,
+    pool_balance_fmt: String,
+    pool_blocks_found: u64,
+    pool_total_earned: u64,
+    pool_total_earned_fmt: String,
+    pool_sse_url: String,
+    pool_events: Vec<String>,
 }
 
 impl Default for LiTCGui {
@@ -236,6 +250,18 @@ impl Default for LiTCGui {
             pool_payout_addr: String::new(),
             pool_running: Arc::new(AtomicBool::new(false)),
             pool_status: String::new(),
+            pool_register_addr: String::new(),
+            pool_label: "gui-miner".into(),
+            pool_min_payout: "".into(),
+            pool_session_token: String::new(),
+            pool_registered: false,
+            pool_balance_sat: 0,
+            pool_balance_fmt: "0.00000000 LIT".into(),
+            pool_blocks_found: 0,
+            pool_total_earned: 0,
+            pool_total_earned_fmt: "0.00000000 LIT".into(),
+            pool_sse_url: String::new(),
+            pool_events: Vec::new(),
         }
     }
 }
@@ -394,12 +420,128 @@ impl LiTCGui {
 
         ui.add_space(16.0);
         ui.separator();
-        ui.label("Local Mining майнит в ваш кошелёк. Pool Mining майнит на указанный пул.");
-        ui.heading("Pool Mining");
+        ui.label("Smart Pool — регистрация через ML-DSA-2. Баланс и выплаты внутри пула.");
+
+        // ── Registration section ──
+        ui.heading("Pool Registration");
         ui.horizontal(|ui| {
             ui.label("Pool URL:");
             ui.add(egui::TextEdit::singleline(&mut self.pool_url).desired_width(250.0));
         });
+        ui.horizontal(|ui| {
+            ui.label("Your Address:");
+            ui.add(egui::TextEdit::singleline(&mut self.pool_register_addr).desired_width(280.0).hint_text("litc1q..."));
+            if ui.button("Paste from Wallet").clicked() {
+                if let Some(ref info) = state.wallet_info {
+                    self.pool_register_addr = info.address.clone();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Worker Label:");
+            ui.add(egui::TextEdit::singleline(&mut self.pool_label).desired_width(150.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Min Auto-Payout:");
+            ui.add(egui::TextEdit::singleline(&mut self.pool_min_payout).desired_width(100.0).hint_text("0.1 LIT"));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Register with Pool").clicked() {
+                let url = self.pool_url.trim().to_string();
+                let address = self.pool_register_addr.trim().to_string();
+                let label = self.pool_label.trim().to_string();
+                let min_payout = self.pool_min_payout.trim().to_string();
+                let admin_url = self.rpc_url.clone();
+                if address.is_empty() {
+                    self.pool_status = "Enter your LIT address.".into();
+                } else {
+                    self.pool_status = "Registering...".into();
+                    std::thread::spawn(move || {
+                        // Build registration message: sha256("pool-register:<address>:<min_payout>")
+                        let payload = format!("pool-register:{}:{}", address, min_payout);
+                        let msg_hash = litc_primitives::sha256d(payload.as_bytes());
+                        let msg_hex = hex::encode(msg_hash.0);
+
+                        // Sign with wallet index 0 on admin RPC.
+                        match rpc_call(&admin_url, "signmessage", json!([0, msg_hex])) {
+                            Ok(sig_resp) => {
+                                let pk = sig_resp["pubkey_hex"].as_str().unwrap_or("");
+                                let sig = sig_resp["signature_hex"].as_str().unwrap_or("");
+                                // Register on the pool.
+                                match rpc_call(&url, "pool_register", json!([address, pk, sig, min_payout, label])) {
+                                    Ok(reg) => {
+                                        let token = reg["session_token"].as_str().unwrap_or("");
+                                        let fee = reg["fee_pct"].as_f64().unwrap_or(0.0);
+                                        eprintln!("[pool] registered! session={token} fee={fee}%");
+                                    }
+                                    Err(e) => eprintln!("[pool] register failed: {e}"),
+                                }
+                            }
+                            Err(e) => eprintln!("[pool] signmessage failed: {e}"),
+                        }
+                    });
+                }
+            }
+            if self.pool_registered {
+                ui.colored_label(egui::Color32::GREEN, "● Registered");
+            }
+        });
+
+        // ── Balance / Session info (after registration) ──
+        if self.pool_registered && !self.pool_session_token.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.heading("Pool Balance");
+            egui::Grid::new("pool_balance").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                ui.label("Session:"); ui.monospace(&self.pool_session_token[..16]); ui.end_row();
+                ui.label("Balance:"); ui.monospace(&self.pool_balance_fmt); ui.end_row();
+                ui.label("Blocks Found:"); ui.label(format!("{}", self.pool_blocks_found)); ui.end_row();
+                ui.label("Total Earned:"); ui.monospace(&self.pool_total_earned_fmt); ui.end_row();
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Refresh Balance").clicked() {
+                    let url = self.pool_url.clone();
+                    let token = self.pool_session_token.clone();
+                    std::thread::spawn(move || {
+                        match rpc_call(&url, "pool_balance", json!([token])) {
+                            Ok(v) => eprintln!("[pool] balance={}", v["balance_formatted"].as_str().unwrap_or("?")),
+                            Err(e) => eprintln!("[pool] balance error: {e}"),
+                        }
+                    });
+                }
+                if ui.button("Withdraw All").clicked() {
+                    let url = self.pool_url.clone();
+                    let token = self.pool_session_token.clone();
+                    let admin_url = self.rpc_url.clone();
+                    std::thread::spawn(move || {
+                        // Withdraw via admin RPC (pool_balance needs wallet access).
+                        // pool_withdraw is an admin RPC (needs wallet seed).
+                        match rpc_call(&admin_url, "pool_withdraw", json!([token, ""])) {
+                            Ok(v) => eprintln!("[pool] withdrawn: {} txid={}", v["amount_formatted"].as_str().unwrap_or("?"), v["txid"].as_str().unwrap_or("?")),
+                            Err(e) => eprintln!("[pool] withdraw failed: {e}"),
+                        }
+                    });
+                }
+            });
+
+            // ── Events ──
+            if !self.pool_events.is_empty() {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.heading("Events");
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for ev in &self.pool_events {
+                        ui.monospace(ev);
+                    }
+                });
+            }
+        }
+
+        // ── Legacy pool mining (fallback) ──
+        ui.add_space(16.0);
+        ui.separator();
+        ui.label("Legacy Pool Mining (без регистрации)");
         ui.horizontal(|ui| {
             ui.label("Worker:");
             ui.add(egui::TextEdit::singleline(&mut self.pool_worker).desired_width(150.0));
@@ -411,19 +553,19 @@ impl LiTCGui {
         ui.horizontal(|ui| {
             let running = self.pool_running.load(Ordering::Relaxed);
             if running {
-                if ui.button("Stop Pool Mining").clicked() {
+                if ui.button("Stop Legacy Mining").clicked() {
                     self.pool_running.store(false, Ordering::Relaxed);
                     self.pool_status = "Pool mining stopped.".into();
                 }
-                ui.colored_label(egui::Color32::GREEN, "● Pool mining");
+                ui.colored_label(egui::Color32::GREEN, "● Mining (legacy)");
             } else {
-                if ui.button("Start Pool Mining").clicked() {
+                if ui.button("Start Legacy Mining").clicked() {
                     let url = self.pool_url.trim().to_string();
                     if !url.starts_with("http://") && !url.starts_with("https://") {
-                        self.pool_status = "Invalid pool URL — must start with http:// or https://".into();
+                        self.pool_status = "Invalid pool URL".into();
                     } else {
                         self.pool_running.store(true, Ordering::Relaxed);
-                        self.pool_status = "Pool mining started.".into();
+                        self.pool_status = "Legacy mining started.".into();
                         let payout = self.pool_payout_addr.trim().to_string();
                         pool_mine_loop(&url, &self.pool_worker, &payout, self.pool_running.clone());
                     }
@@ -431,10 +573,11 @@ impl LiTCGui {
                 ui.colored_label(egui::Color32::GRAY, "○ Not mining");
             }
         });
+
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("Pool Payout (admin)").clicked() {
+            if ui.button("Pool Payout (admin, all workers)").clicked() {
                 let url = self.rpc_url.clone();
                 let specific = String::new();
                 std::thread::spawn(move || {
@@ -446,9 +589,9 @@ impl LiTCGui {
                         Err(e) => eprintln!("[gui] pool payout failed: {e}"),
                     }
                 });
-                self.pool_status = "Pool payout requested (admin RPC).".into();
+                self.pool_status = "Pool payout requested.".into();
             }
-            ui.label("Выплатить заработанное всем воркерам (требуется admin RPC).");
+            ui.label("Выплатить всем воркерам (admin RPC).");
         });
         if !self.pool_status.is_empty() {
             ui.label(&self.pool_status);

@@ -28,7 +28,7 @@ use litc_keystore::FileKeyStore;
 use litc_miner::{assemble_block, BlockTemplate, CpuMiner, MinerBackend};
 use litc_pow::{adjust_target, block_work, EPOCH_BLOCKS, INITIAL_TARGET, TARGET_TIMESPAN};
 use litc_primitives::chainparams::{ChainParams, Network};
-use litc_primitives::{sha256d, to_bytes, Block, Decodable, Hash32, Reader, Transaction};
+use litc_primitives::{mldsa, sha256d, to_bytes, Block, Decodable, Hash32, Reader, Transaction, COIN};
 use litc_store::state::StateStore;
 use litc_store::{FileStore, PruneConfig, SpendStore};
 use litc_wallet::Wallet;
@@ -112,15 +112,48 @@ struct WalletSection {
 
 /// Mining pool configuration.
 #[derive(Clone, serde::Deserialize)]
-struct PoolConfig {
+pub(crate) struct PoolConfig {
     /// Pool fee percentage (e.g. 1.0 = 1 %).
     #[serde(default)]
-    fee_pct: f64,
+    pub(crate) fee_pct: f64,
     /// Minimum auto-payout threshold in LIT.
     #[serde(default = "default_min_payout")]
-    min_payout: String,
+    pub(crate) min_payout: String,
     /// SSE event server port.
-    event_port: Option<u16>,
+    pub(crate) event_port: Option<u16>,
+}
+
+impl PoolConfig {
+    pub(crate) fn min_payout_sat(&self) -> u64 {
+        let s = self.min_payout.trim();
+        if let Some((whole, frac)) = s.split_once('.') {
+            let whole: u64 = whole.parse().unwrap_or(0);
+            let frac = frac.trim_end_matches('0');
+            let frac_val: u64 = frac.parse().unwrap_or(0);
+            let scale = 10u64.pow(8u32.saturating_sub(frac.len() as u32));
+            whole * COIN + frac_val * scale
+        } else {
+            s.parse().unwrap_or(COIN / 10) // default 0.1 LIT
+        }
+    }
+}
+
+/// A registered pool mining session tied to an ML-DSA-2 keypair.
+#[derive(Clone)]
+pub(crate) struct PoolSession {
+    pub session_token: Hash32,
+    pub address: String,
+    pub pubkey: [u8; mldsa::PK_LEN],
+    pub commitment: [u8; 20],
+    pub label: String,
+    pub min_payout_sat: u64,
+    pub balance_sat: u64,
+    pub total_earned_sat: u64,
+    pub blocks_found: u64,
+    pub last_height: u64,
+    pub created_at: u64,
+    /// Pending SSE events (JSON strings).
+    pub events: Vec<String>,
 }
 
 fn default_p2p_port() -> u16 { 8333 }
@@ -303,14 +336,22 @@ pub(crate) struct Node<S: SpendStore + StateStore> {
     epoch_targets: Vec<[u8; 32]>,
     /// Best-chain block hash + timestamp, indexed by height.
     pub(crate) chain: HashMap<u64, (Hash32, u64)>,
-    /// Mining pool workers.
+    /// Mining pool workers (legacy, no-registration workers).
     pub(crate) pool_workers: Vec<PoolWorker>,
+    /// Registered pool sessions (smart pool, key-bound).
+    pub(crate) pool_sessions: Vec<PoolSession>,
+    /// Pool configuration (fee, auto-payout threshold, etc.).
+    pub(crate) pool_config: PoolConfig,
     /// Whether mining is active (toggled at runtime via RPC).
     pub(crate) mining_enabled: bool,
 }
 
 impl<S: SpendStore + StateStore> Node<S> {
     fn new(store: S, seed: [u8; 32], params: ChainParams) -> Self {
+        Self::with_config(store, seed, params, PoolConfig::default())
+    }
+
+    fn with_config(store: S, seed: [u8; 32], params: ChainParams, pool_config: PoolConfig) -> Self {
         let wallet = Wallet::new(seed);
         let nonce_bytes = litc_keystore::random_seed().unwrap_or([0u8; 32]);
         let my_nonce = u64::from_be_bytes(nonce_bytes[..8].try_into().unwrap());
@@ -330,10 +371,10 @@ impl<S: SpendStore + StateStore> Node<S> {
             chain: HashMap::new(),
             params,
             pool_workers: Vec::new(),
+            pool_sessions: Vec::new(),
+            pool_config,
             mining_enabled: true,
         };
-        // Rebuild the best-chain index so sync/relay work immediately after a
-        // restart (the store already loaded its tip from disk).
         n.sync_chain();
         n
     }
@@ -1326,7 +1367,7 @@ pub fn run(args: Vec<String>) {
         store.save_snapshot(&path).expect("cannot save snapshot");
         println!("{CYAN}{BOLD}[snapshot]{RESET} {CYAN}saved to {snap}{RESET}");
     }
-    let node = Arc::new(Mutex::new(Node::<FileStore>::new(store, seed, params)));
+    let node = Arc::new(Mutex::new(Node::<FileStore>::with_config(store, seed, params, cfg.pool.clone())));
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
     let known: AddrSet = Arc::new(Mutex::new(HashSet::new()));
     known.lock().unwrap().insert(listen);
@@ -1439,6 +1480,12 @@ pub fn run(args: Vec<String>) {
         );
         thread::spawn(move || rpc::start_public(pub_addr, pub_node, pub_peers));
     }
+
+    // Start SSE event server for pool miners.
+    let event_port = cfg.pool.event_port.unwrap_or(18336);
+    let event_node = node.clone();
+    let event_addr = (std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), event_port).into();
+    thread::spawn(move || rpc::start_events(event_addr, event_node));
 
     loop {
         thread::sleep(Duration::from_secs(5));
