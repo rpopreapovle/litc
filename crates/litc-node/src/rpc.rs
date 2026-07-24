@@ -19,6 +19,9 @@ use litc_wallet::Wallet;
 
 use crate::{write_tx, Node, PeerMap};
 
+#[derive(Clone, Copy, PartialEq)]
+enum Access { Admin, Public }
+
 #[derive(Deserialize)]
 struct RpcRequest {
     #[serde(rename = "jsonrpc")]
@@ -175,43 +178,24 @@ fn handle_getinfo(node: &Node<FileStore>, peers: &PeerMap, _params: &[Value], id
 fn handle_getbalance(
     node: &Node<FileStore>,
     w: &Wallet,
-    _ks: &FileKeyStore,
     _params: &[Value],
     id: Value,
 ) -> String {
     let mut sum: u64 = 0;
-    let mut idx = 0u32;
-    loop {
-        let commit = w.commitment_at(idx);
-        if let Some(op) = node.store.find_by_commit(&commit) {
-            if let Some(out) = node.store.utxo(&op) {
+    let mut commits = std::collections::HashSet::new();
+    for idx in 0..=200u32 {
+        commits.insert(w.commitment_at(idx));
+    }
+    for (_op, out) in &node.store.iter_utxos() {
+        if out.script_pubkey.len() >= 20 {
+            let mut prefix = [0u8; 20];
+            prefix.copy_from_slice(&out.script_pubkey[..20]);
+            if commits.contains(&prefix) {
                 sum += out.value.0;
             }
-            idx += 1;
-        } else {
-            let mut found_more = false;
-            for gap in 1..=20u32 {
-                if let Some(op2) = node.store.find_by_commit(&w.commitment_at(idx + gap)) {
-                    if let Some(out2) = node.store.utxo(&op2) {
-                        sum += out2.value.0;
-                    }
-                    found_more = true;
-                }
-            }
-            if found_more {
-                idx += 1;
-                continue;
-            }
-            break;
         }
     }
-    ok(
-        json!({
-            "balance": sum,
-            "balance_formatted": format_amount(sum),
-        }),
-        id,
-    )
+    ok(json!({"balance": sum, "balance_formatted": format_amount(sum)}), id)
 }
 
 fn handle_getaddress(_node: &Node<FileStore>, w: &Wallet, _params: &[Value], id: Value) -> String {
@@ -417,6 +401,16 @@ fn handle_getpeerinfo(
     ok(json!(info), id)
 }
 
+fn handle_setmining(node: &mut Node<FileStore>, params: &[Value], id: Value) -> String {
+    let enabled = params.first().and_then(|v| v.as_bool()).unwrap_or(false);
+    node.mining_enabled = enabled;
+    ok(json!({"mining_enabled": enabled}), id)
+}
+
+fn handle_getminingstatus(node: &Node<FileStore>, _params: &[Value], id: Value) -> String {
+    ok(json!({"mining_enabled": node.mining_enabled}), id)
+}
+
 fn handle_getconnectioncount(
     _node: &Node<FileStore>,
     peers: &PeerMap,
@@ -562,14 +556,28 @@ fn handle_get_network_params(node: &Node<FileStore>, _params: &[Value], id: Valu
     )
 }
 
+/// Methods safe to expose publicly (read-only + light wallet + pool mining).
+const PUBLIC_METHODS: &[&str] = &[
+    "getblockcount", "getbestblockhash", "getblockhash", "getblock",
+    "getinfo", "getmininginfo", "getconnectioncount", "getpeerinfo",
+    "get_utxos", "get_tx", "broadcast_raw_tx",
+    "get_header_by_height", "get_network_params",
+    "getblocktemplate", "submitblock", "getpoolinfo",
+];
+
 fn handle_request(
     node: &Arc<Mutex<Node<FileStore>>>,
     ks: &FileKeyStore,
     wallet: &Wallet,
     peers: &PeerMap,
     req: RpcRequest,
+    access: Access,
 ) -> String {
     let id = req.id.unwrap_or(Value::Null);
+
+    if access == Access::Public && !PUBLIC_METHODS.contains(&req.method.as_str()) {
+        return err(-32601, &format!("method not found: {}", req.method), id);
+    }
 
     match req.method.as_str() {
         "getblockcount" => {
@@ -594,7 +602,7 @@ fn handle_request(
         }
         "getbalance" => {
             let n = node.lock().unwrap();
-            handle_getbalance(&n, wallet, ks, &req.params, id)
+            handle_getbalance(&n, wallet, &req.params, id)
         }
         "getaddress" => {
             let n = node.lock().unwrap();
@@ -632,6 +640,14 @@ fn handle_request(
             let n = node.lock().unwrap();
             handle_getpeerinfo(&n, peers, &req.params, id)
         }
+        "setmining" => {
+            let mut n = node.lock().unwrap();
+            handle_setmining(&mut n, &req.params, id)
+        }
+        "getminingstatus" => {
+            let n = node.lock().unwrap();
+            handle_getminingstatus(&n, &req.params, id)
+        }
         "getconnectioncount" => {
             let n = node.lock().unwrap();
             handle_getconnectioncount(&n, peers, &req.params, id)
@@ -666,6 +682,7 @@ fn handle_conn(
     ks: FileKeyStore,
     wallet: Wallet,
     peers: PeerMap,
+    access: Access,
 ) {
     let mut reader = std::io::BufReader::new(&mut stream);
     let mut buf = Vec::new();
@@ -713,8 +730,44 @@ fn handle_conn(
         }
     };
 
-    let resp = handle_request(&node, &ks, &wallet, &peers, req);
+    let resp = handle_request(&node, &ks, &wallet, &peers, req, access);
     let _ = write_response(&mut stream, &resp);
+}
+
+fn start_listener(
+    bind_addr: std::net::SocketAddr,
+    node: Arc<Mutex<Node<FileStore>>>,
+    wallet_seed: Option<[u8; 32]>,
+    peers: PeerMap,
+    access: Access,
+    label: &str,
+) {
+    let addr = bind_addr;
+    let listener = match TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{RED}{BOLD}[{label}]{RESET} {RED}cannot bind {addr}: {e}{RESET}");
+            return;
+        }
+    };
+    println!("{MAGENTA}{BOLD}[{label}]{RESET} {MAGENTA}listening on {addr}{RESET}");
+
+    for stream in listener.incoming().flatten() {
+        let node = node.clone();
+        let peers = peers.clone();
+        let seed = wallet_seed;
+        let acc = access;
+        thread::spawn(move || {
+            let wallet = Wallet::new(seed.unwrap_or([0u8; 32]));
+            let ks = FileKeyStore::new(
+                std::env::var("LITC_DATADIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("data"))
+                    .join("wallet.dat"),
+            );
+            handle_conn(stream, node, ks, wallet, peers, acc);
+        });
+    }
 }
 
 fn write_response(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
@@ -733,28 +786,13 @@ pub fn start(
     wallet_seed: [u8; 32],
     peers: PeerMap,
 ) {
-    let addr = bind_addr;
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("{RED}{BOLD}[rpc]{RESET} {RED}cannot bind {addr}: {e}{RESET}");
-            return;
-        }
-    };
-    println!("{MAGENTA}{BOLD}[rpc]{RESET} {MAGENTA}listening on {addr}{RESET}");
+    start_listener(bind_addr, node, Some(wallet_seed), peers, Access::Admin, "rpc");
+}
 
-    for stream in listener.incoming().flatten() {
-        let node = node.clone();
-        let wallet = Wallet::new(wallet_seed);
-        let peers = peers.clone();
-        thread::spawn(move || {
-            let ks = FileKeyStore::new(
-                std::env::var("LITC_DATADIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("data"))
-                    .join("wallet.dat"),
-            );
-            handle_conn(stream, node, ks, wallet, peers);
-        });
-    }
+pub fn start_public(
+    bind_addr: std::net::SocketAddr,
+    node: Arc<Mutex<Node<FileStore>>>,
+    peers: PeerMap,
+) {
+    start_listener(bind_addr, node, None, peers, Access::Public, "pub");
 }

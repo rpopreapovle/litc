@@ -14,6 +14,7 @@ members = [
     "crates/litc-cli",
     "crates/litc-ffi",
     "crates/litc-lightwallet",
+    "crates/litc-gui",
 ]
 
 [workspace.package]

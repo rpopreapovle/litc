@@ -21,3 +21,4 @@ litc-core = { path = "../litc-core" }
 litc-miner = { path = "../litc-miner" }
 litc-pow = { path = "../litc-pow" }
 litc-primitives = { path = "../litc-primitives" }
+litc-gui = { path = "../litc-gui" }

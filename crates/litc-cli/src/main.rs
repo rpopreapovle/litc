@@ -440,7 +440,7 @@ fn cmd_pool_mine(args: &[String]) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: litc <node|wallet|pool-mine> [...]");
+        eprintln!("usage: litc <node|wallet|pool-mine|gui> [...]");
         return;
     }
     match args[1].as_str() {
@@ -450,10 +450,15 @@ fn main() {
             v.extend_from_slice(&args[2..]);
             litc_node::run(v);
         }
+        "gui" => {
+            let mut v = vec!["litc-gui".to_string()];
+            v.extend_from_slice(&args[2..]);
+            litc_gui::run(v);
+        }
         "wallet" => cmd_wallet(&args[2..]),
         "pool-mine" => cmd_pool_mine(&args[2..]),
         other => {
-            eprintln!("unknown subcommand: {other} (expected `node` | `wallet` | `pool-mine`)")
+            eprintln!("unknown subcommand: {other} (expected `node` | `wallet` | `pool-mine` | `gui`)")
         }
     }
 }

@@ -221,6 +221,8 @@ pub(crate) struct Node<S: SpendStore + StateStore> {
     pub(crate) chain: HashMap<u64, (Hash32, u64)>,
     /// Mining pool workers.
     pub(crate) pool_workers: Vec<PoolWorker>,
+    /// Whether mining is active (toggled at runtime via RPC).
+    pub(crate) mining_enabled: bool,
 }
 
 impl<S: SpendStore + StateStore> Node<S> {
@@ -244,6 +246,7 @@ impl<S: SpendStore + StateStore> Node<S> {
             chain: HashMap::new(),
             params,
             pool_workers: Vec::new(),
+            mining_enabled: true,
         };
         // Rebuild the best-chain index so sync/relay work immediately after a
         // restart (the store already loaded its tip from disk).
@@ -976,6 +979,11 @@ fn miner_loop<S: SpendStore + StateStore>(
         }
     }
     loop {
+        // Check if mining is enabled (toggled via RPC).
+        if !node.lock().unwrap().mining_enabled {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         let (template, target) = {
             let mut n = node.lock().unwrap();
             n.make_template()
@@ -1094,6 +1102,9 @@ pub fn run(args: Vec<String>) {
     let mut rpc_port: Option<u16> = None;
     let mut rpc_bind: std::net::IpAddr =
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    let mut public_rpc_port: Option<u16> = None;
+    let mut public_rpc_bind: std::net::IpAddr =
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1113,10 +1124,34 @@ pub fn run(args: Vec<String>) {
                 }
                 i += 2;
             }
-            "--rpc-bind" => {
+            "--rpc-bind" | "--rpc-host" => {
+                if let Some(s) = args.get(i + 1) {
+                    if let Ok(p) = s.parse::<std::net::IpAddr>() {
+                        if p.is_unspecified() {
+                            rpc_bind = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+                            eprintln!("{RED}{BOLD}[warn]{RESET} {YELLOW}--rpc-bind 0.0.0.0 is dangerous (no auth); using 127.0.0.1 instead{RESET}");
+                        } else {
+                            rpc_bind = p;
+                            if !p.is_loopback() {
+                                eprintln!("{RED}{BOLD}[warn]{RESET} {YELLOW}RPC exposed on {p} with no authentication — anyone can spend wallet funds!{RESET}");
+                            }
+                        }
+                    }
+                }
+                i += 2;
+            }
+            "--public-rpc-port" => {
                 if let Some(s) = args.get(i + 1) {
                     if let Ok(p) = s.parse() {
-                        rpc_bind = p;
+                        public_rpc_port = Some(p);
+                    }
+                }
+                i += 2;
+            }
+            "--public-rpc-bind" => {
+                if let Some(s) = args.get(i + 1) {
+                    if let Ok(p) = s.parse() {
+                        public_rpc_bind = p;
                     }
                 }
                 i += 2;
@@ -1300,35 +1335,43 @@ pub fn run(args: Vec<String>) {
         connect_to(addr, p, nd, kn, listen, &connecting);
     }
 
-    if mine {
-        let miner: Box<dyn MinerBackend + Send> = if use_gpu {
-            #[cfg(feature = "gpu")]
-            {
-                match WgpuMiner::new() {
-                    Ok(m) => {
-                        println!("{MAGENTA}{BOLD}[gpu]{RESET} {MAGENTA}mining backend: wgpu (Vulkan){RESET}");
-                        Box::new(m)
-                    }
-                    Err(e) => {
-                        eprintln!("{RED}{BOLD}[gpu]{RESET} {RED}init failed: {e}; falling back to CPU{RESET}");
-                        Box::new(CpuMiner)
-                    }
+    // Always spawn the miner loop (so mining can be toggled at runtime via RPC).
+    // The --no-mine flag just sets the initial state.
+    {
+        let mut n = node.lock().unwrap();
+        n.mining_enabled = mine;
+    }
+    let miner: Box<dyn MinerBackend + Send> = if use_gpu {
+        #[cfg(feature = "gpu")]
+        {
+            match WgpuMiner::new() {
+                Ok(m) => {
+                    println!("{MAGENTA}{BOLD}[gpu]{RESET} {MAGENTA}mining backend: wgpu (Vulkan){RESET}");
+                    Box::new(m)
+                }
+                Err(e) => {
+                    eprintln!("{RED}{BOLD}[gpu]{RESET} {RED}init failed: {e}; falling back to CPU{RESET}");
+                    Box::new(CpuMiner)
                 }
             }
-            #[cfg(not(feature = "gpu"))]
-            {
-                eprintln!("{YELLOW}{BOLD}[gpu]{RESET} {YELLOW}node built without --features gpu; using CPU miner{RESET}");
-                Box::new(CpuMiner)
-            }
-        } else {
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            eprintln!("{YELLOW}{BOLD}[gpu]{RESET} {YELLOW}node built without --features gpu; using CPU miner{RESET}");
             Box::new(CpuMiner)
-        };
-        let mnode = node.clone();
-        let mpeers = peers.clone();
-        thread::spawn(move || miner_loop(mnode, mpeers, miner));
+        }
     } else {
-        println!("{DIM}{BOLD}[mine]{RESET} {DIM}mining disabled (--no-mine){RESET}");
-    }
+        Box::new(CpuMiner)
+    };
+    let mnode = node.clone();
+    let mpeers = peers.clone();
+    let m_enabled = mine;
+    thread::spawn(move || {
+        if !m_enabled {
+            eprintln!("{DIM}{BOLD}[mine]{RESET} {DIM}mining disabled (--no-mine, toggle via RPC){RESET}");
+        }
+        miner_loop(mnode, mpeers, miner)
+    });
 
     if let Some(rpc_port) = rpc_port {
         let rpc_node = node.clone();
@@ -1338,6 +1381,16 @@ pub fn run(args: Vec<String>) {
         let rpc_peers = peers.clone();
         let rpc_addr = (rpc_bind, rpc_port).into();
         thread::spawn(move || rpc::start(rpc_addr, rpc_node, rpc_seed, rpc_peers));
+    }
+
+    if let Some(pub_port) = public_rpc_port {
+        let pub_node = node.clone();
+        let pub_peers = peers.clone();
+        let pub_addr = (public_rpc_bind, pub_port).into();
+        println!(
+            "{MAGENTA}{BOLD}[pub]{RESET} {MAGENTA}public RPC on {pub_addr} (read-only + pool mining){RESET}"
+        );
+        thread::spawn(move || rpc::start_public(pub_addr, pub_node, pub_peers));
     }
 
     loop {
