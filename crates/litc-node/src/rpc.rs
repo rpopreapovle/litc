@@ -314,11 +314,21 @@ fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -
         .and_then(|v| v.as_str())
         .unwrap_or("anon")
         .to_string();
+    let payout_addr = params
+        .get(2)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let addr = from;
     let height = node.best_height();
+    let subsidy = litc_core::block_subsidy(height).0;
     if let Some(w) = node.pool_workers.iter_mut().find(|w| w.name == worker_name) {
         w.blocks_found += 1;
         w.last_height = height;
+        w.earned += subsidy;
+        if payout_addr.is_some() {
+            w.payout_addr = payout_addr;
+        }
     } else {
         node.pool_workers.push(crate::PoolWorker {
             addr,
@@ -326,6 +336,8 @@ fn handle_submitblock(node: &mut Node<FileStore>, params: &[Value], id: Value) -
             blocks_found: 1,
             shares: 0,
             last_height: height,
+            payout_addr,
+            earned: subsidy,
         });
     }
     ok(json!(true), id)
@@ -338,14 +350,25 @@ fn handle_getblocktemplate(node: &mut Node<FileStore>, params: &[Value], id: Val
         .and_then(|v| v.as_str())
         .unwrap_or("anon")
         .to_string();
+    let payout_addr = params
+        .get(1)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let addr = "0.0.0.0:0".parse().unwrap();
-    if !node.pool_workers.iter().any(|w| w.name == worker_name) {
+    if let Some(w) = node.pool_workers.iter_mut().find(|w| w.name == worker_name) {
+        if payout_addr.is_some() {
+            w.payout_addr = payout_addr;
+        }
+    } else {
         node.pool_workers.push(crate::PoolWorker {
             addr,
             name: worker_name,
             blocks_found: 0,
             shares: 0,
             last_height: 0,
+            payout_addr,
+            earned: 0,
         });
     }
     let (template, target) = node.make_template();
@@ -378,11 +401,81 @@ fn handle_getpoolinfo(node: &Node<FileStore>, _params: &[Value], id: Value) -> S
                 "blocks_found": w.blocks_found,
                 "shares": w.shares,
                 "last_height": w.last_height,
+                "payout_addr": w.payout_addr,
+                "earned": w.earned,
+                "earned_formatted": format_amount(w.earned),
             })
         })
         .collect();
     ok(
         json!({"workers": workers, "total_workers": workers.len()}),
+        id,
+    )
+}
+
+fn handle_pool_payout(
+    node: &mut Node<FileStore>,
+    w: &Wallet,
+    _ks: &FileKeyStore,
+    params: &[Value],
+    id: Value,
+) -> String {
+    // Optional: only pay a specific worker.
+    let only_name = params.first().and_then(|v| v.as_str()).map(|s| s.to_string());
+    let mut total_paid: u64 = 0;
+    let mut payouts: Vec<Value> = Vec::new();
+
+    for worker in &node.pool_workers.clone() {
+        if worker.earned == 0 || worker.payout_addr.is_none() {
+            continue;
+        }
+        if let Some(ref only) = only_name {
+            if &worker.name != only {
+                continue;
+            }
+        }
+        let addr = worker.payout_addr.as_ref().unwrap();
+        let (_, to_commit) = match litc_primitives::mldsa::parse_address(addr) {
+            Some(c) => c,
+            None => {
+                payouts.push(json!({
+                    "worker": worker.name,
+                    "error": "invalid payout address",
+                }));
+                continue;
+            }
+        };
+        let amount = Amount(worker.earned);
+        match w.spend_from(&node.store, 0, to_commit, amount) {
+            Ok(tx) => {
+                total_paid += worker.earned;
+                payouts.push(json!({
+                    "worker": worker.name,
+                    "amount": worker.earned,
+                    "amount_formatted": format_amount(worker.earned),
+                    "txid": tx.txid().to_hex(),
+                }));
+                write_tx(&tx);
+                // Reset earned for this worker (they've been paid).
+                if let Some(w2) = node.pool_workers.iter_mut().find(|w2| w2.name == worker.name) {
+                    w2.earned = 0;
+                }
+            }
+            Err(e) => {
+                payouts.push(json!({
+                    "worker": worker.name,
+                    "error": format!("send failed: {e}"),
+                }));
+            }
+        }
+    }
+
+    ok(
+        json!({
+            "total_paid": total_paid,
+            "total_paid_formatted": format_amount(total_paid),
+            "payouts": payouts,
+        }),
         id,
     )
 }
@@ -631,6 +724,10 @@ fn handle_request(
         "submitblock" => {
             let mut n = node.lock().unwrap();
             handle_submitblock(&mut n, &req.params, id)
+        }
+        "pool_payout" => {
+            let mut n = node.lock().unwrap();
+            handle_pool_payout(&mut n, wallet, ks, &req.params, id)
         }
         "getpoolinfo" => {
             let n = node.lock().unwrap();

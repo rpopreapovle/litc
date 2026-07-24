@@ -114,9 +114,10 @@ fn rpc_send(url: &str, to: &str, amount: &str) -> Result<serde_json::Value, Stri
     rpc_call(url, "send", json!([to, amount]))
 }
 
-fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
+fn pool_mine_loop(url: &str, worker: &str, payout_addr: &str, running: Arc<AtomicBool>) {
         let url = url.trim_end_matches('/').to_string();
         let worker = worker.to_string();
+        let payout_addr = if payout_addr.is_empty() { String::new() } else { payout_addr.to_string() };
         let pool_label = url.clone();
         std::thread::spawn(move || {
         eprintln!("[pool] mining against {pool_label} as '{worker}'");
@@ -131,7 +132,8 @@ fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
         let mut scratch: Option<litc_pow::Scratch> = None;
 
         while running.load(Ordering::Relaxed) {
-            let tmpl = match rpc_call(&url, "getblocktemplate", json!([worker])) {
+            let params = if payout_addr.is_empty() { json!([worker]) } else { json!([worker, payout_addr]) };
+            let tmpl = match rpc_call(&url, "getblocktemplate", params) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("[pool] {e}");
@@ -172,7 +174,8 @@ fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
                     block.header.nonce = nonce;
                     let submit_hex: String = litc_primitives::to_bytes(&block)
                         .iter().map(|b| format!("{b:02x}")).collect();
-                    match rpc_call(&url, "submitblock", json!([submit_hex, worker])) {
+                    let submit_params = if payout_addr.is_empty() { json!([submit_hex, worker]) } else { json!([submit_hex, worker, payout_addr]) };
+                    match rpc_call(&url, "submitblock", submit_params) {
                         Ok(_) => {
                             eprintln!("[pool] block #{height} found! nonce={nonce}");
                             std::thread::sleep(Duration::from_millis(500));
@@ -212,6 +215,7 @@ struct LiTCGui {
     // Pool mining
     pool_url: String,
     pool_worker: String,
+    pool_payout_addr: String,
     pool_running: Arc<AtomicBool>,
     pool_status: String,
 }
@@ -229,6 +233,7 @@ impl Default for LiTCGui {
             send_status: String::new(),
             pool_url: "http://127.0.0.1:18335".into(),
             pool_worker: "gui-miner".into(),
+            pool_payout_addr: String::new(),
             pool_running: Arc::new(AtomicBool::new(false)),
             pool_status: String::new(),
         }
@@ -400,6 +405,10 @@ impl LiTCGui {
             ui.add(egui::TextEdit::singleline(&mut self.pool_worker).desired_width(150.0));
         });
         ui.horizontal(|ui| {
+            ui.label("Payout Address:");
+            ui.add(egui::TextEdit::singleline(&mut self.pool_payout_addr).desired_width(280.0).hint_text("litc1q... (опционально)"));
+        });
+        ui.horizontal(|ui| {
             let running = self.pool_running.load(Ordering::Relaxed);
             if running {
                 if ui.button("Stop Pool Mining").clicked() {
@@ -415,11 +424,31 @@ impl LiTCGui {
                     } else {
                         self.pool_running.store(true, Ordering::Relaxed);
                         self.pool_status = "Pool mining started.".into();
-                        pool_mine_loop(&url, &self.pool_worker, self.pool_running.clone());
+                        let payout = self.pool_payout_addr.trim().to_string();
+                        pool_mine_loop(&url, &self.pool_worker, &payout, self.pool_running.clone());
                     }
                 }
                 ui.colored_label(egui::Color32::GRAY, "○ Not mining");
             }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Pool Payout (admin)").clicked() {
+                let url = self.rpc_url.clone();
+                let specific = String::new();
+                std::thread::spawn(move || {
+                    match rpc_call(&url, "pool_payout", json!([specific])) {
+                        Ok(v) => {
+                            let total = v["total_paid_formatted"].as_str().unwrap_or("0 LIT");
+                            eprintln!("[gui] pool payout done: {total}");
+                        }
+                        Err(e) => eprintln!("[gui] pool payout failed: {e}"),
+                    }
+                });
+                self.pool_status = "Pool payout requested (admin RPC).".into();
+            }
+            ui.label("Выплатить заработанное всем воркерам (требуется admin RPC).");
         });
         if !self.pool_status.is_empty() {
             ui.label(&self.pool_status);

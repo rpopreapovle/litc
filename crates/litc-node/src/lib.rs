@@ -151,6 +151,10 @@ pub(crate) struct PoolWorker {
     pub shares: u64,
     /// Last block height this worker submitted a share/block for.
     pub last_height: u64,
+    /// Worker's LIT payout address (ML-DSA-2), e.g. `LIT1abc...`.
+    pub payout_addr: Option<String>,
+    /// Amount in satoshis the pool owes this worker for blocks found.
+    pub earned: u64,
 }
 
 fn now_secs() -> u64 {
