@@ -361,6 +361,7 @@ impl LiTCGui {
         ui.separator();
 
         ui.heading("Local Mining");
+        ui.label("Майнит в кошелёк ноды (ваш баланс).");
         if state.node_info.is_some() {
             ui.horizontal(|ui| {
                 let enabled = state.mining_enabled;
@@ -388,6 +389,7 @@ impl LiTCGui {
 
         ui.add_space(16.0);
         ui.separator();
+        ui.label("Local Mining майнит в ваш кошелёк. Pool Mining майнит на указанный пул.");
         ui.heading("Pool Mining");
         ui.horizontal(|ui| {
             ui.label("Pool URL:");
