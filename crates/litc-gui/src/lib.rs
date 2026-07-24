@@ -49,6 +49,9 @@ enum Tab { Node, Miner, Wallet }
 
 fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let url = url.trim_end_matches('/');
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("Bad URL: '{url}' (method={method})"));
+    }
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 });
     let resp = ureq::post(url)
         .set("Content-Type", "application/json")
@@ -402,9 +405,14 @@ impl LiTCGui {
                 ui.colored_label(egui::Color32::GREEN, "● Pool mining");
             } else {
                 if ui.button("Start Pool Mining").clicked() {
-                    self.pool_running.store(true, Ordering::Relaxed);
-                    self.pool_status = "Pool mining started.".into();
-                    pool_mine_loop(&self.pool_url, &self.pool_worker, self.pool_running.clone());
+                    let url = self.pool_url.trim().to_string();
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        self.pool_status = "Invalid pool URL — must start with http:// or https://".into();
+                    } else {
+                        self.pool_running.store(true, Ordering::Relaxed);
+                        self.pool_status = "Pool mining started.".into();
+                        pool_mine_loop(&url, &self.pool_worker, self.pool_running.clone());
+                    }
                 }
                 ui.colored_label(egui::Color32::GRAY, "○ Not mining");
             }
