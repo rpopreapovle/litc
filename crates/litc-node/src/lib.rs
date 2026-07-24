@@ -299,10 +299,15 @@ impl<S: SpendStore + StateStore> Node<S> {
         let coinbase_value = block_subsidy_with(height, self.params.halving_interval);
         // Pay the coinbase to the wallet's ML-DSA-2 commitment at index 0.
         let coinbase_commit = self.wallet.commitment_at(0);
+        let ts = {
+            let now = now_secs();
+            let parent_ts = self.chain.get(&(height.saturating_sub(1))).map(|x| x.1).unwrap_or(0);
+            if now > parent_ts { now } else { parent_ts + 1 }
+        };
         let mut template = BlockTemplate {
             prev_block: self.tip,
             height,
-            timestamp: now_secs(),
+            timestamp: ts,
             epoch_seed: Hash32(seed),
             coinbase_value,
             coinbase_script: coinbase_commit.to_vec(),

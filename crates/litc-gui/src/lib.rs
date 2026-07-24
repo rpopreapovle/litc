@@ -168,8 +168,14 @@ fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
                     let submit_hex: String = litc_primitives::to_bytes(&block)
                         .iter().map(|b| format!("{b:02x}")).collect();
                     match rpc_call(&url, "submitblock", json!([submit_hex, worker])) {
-                        Ok(_) => eprintln!("[pool] block #{height} found! nonce={nonce}"),
-                        Err(e) => eprintln!("[pool] submit failed: {e}"),
+                        Ok(_) => {
+                            eprintln!("[pool] block #{height} found! nonce={nonce}");
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        Err(e) => {
+                            eprintln!("[pool] submit failed: {e}");
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
                     }
                     nonce_start = nonce.wrapping_add(1);
                     break;
