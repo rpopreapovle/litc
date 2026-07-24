@@ -48,6 +48,7 @@ struct AppState {
 enum Tab { Node, Miner, Wallet }
 
 fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let url = url.trim_end_matches('/');
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 });
     let resp = ureq::post(url)
         .set("Content-Type", "application/json")
@@ -111,9 +112,9 @@ fn rpc_send(url: &str, to: &str, amount: &str) -> Result<serde_json::Value, Stri
 }
 
 fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
-    let url = url.to_string();
-    let worker = worker.to_string();
-    std::thread::spawn(move || {
+        let url = url.trim_end_matches('/').to_string();
+        let worker = worker.to_string();
+        std::thread::spawn(move || {
         let mut nonce_start: u64 = {
             let seed = match litc_keystore::random_seed() {
                 Ok(s) => s,

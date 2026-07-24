@@ -13,7 +13,7 @@ egui = "0.27"
 eframe = "0.27"
 hex = "0.4"
 serde_json = "1"
-ureq = { version = "2", default-features = false, features = ["json"] }
+ureq = { version = "2", features = ["json"] }
 litc-primitives = { path = "../litc-primitives" }
 litc-pow = { path = "../litc-pow" }
 litc-keystore = { path = "../litc-keystore" }
