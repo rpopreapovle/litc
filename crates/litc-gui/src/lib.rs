@@ -117,7 +117,9 @@ fn rpc_send(url: &str, to: &str, amount: &str) -> Result<serde_json::Value, Stri
 fn pool_mine_loop(url: &str, worker: &str, running: Arc<AtomicBool>) {
         let url = url.trim_end_matches('/').to_string();
         let worker = worker.to_string();
+        let pool_label = url.clone();
         std::thread::spawn(move || {
+        eprintln!("[pool] mining against {pool_label} as '{worker}'");
         let mut nonce_start: u64 = {
             let seed = match litc_keystore::random_seed() {
                 Ok(s) => s,
