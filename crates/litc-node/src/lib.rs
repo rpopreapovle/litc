@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -38,72 +39,151 @@ use litc_miner_gpu_wgpu::WgpuMiner;
 
 mod rpc;
 
-/// Node configuration loaded from `$LITC_DATADIR/config.toml` (`[node]` table).
+/// Full node configuration loaded from `$LITC_DATADIR/config.toml` or
+/// `--config <path>`. CLI flags override individual fields at runtime.
+#[derive(serde::Deserialize)]
 struct NodeConfig {
+    #[serde(default)]
+    node: NodeSection,
+    #[serde(default)]
+    store: StoreSection,
+    #[serde(default)]
+    wallet: WalletSection,
+    #[serde(default)]
+    pool: PoolConfig,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig {
+            node: NodeSection::default(),
+            store: StoreSection::default(),
+            wallet: WalletSection::default(),
+            pool: PoolConfig::default(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NodeSection {
+    /// P2P listen port (default: 8333).
+    #[serde(default = "default_p2p_port")]
+    port: u16,
+    /// Admin RPC port.
+    rpc_port: Option<u16>,
+    /// Admin RPC bind address (default: 127.0.0.1).
+    #[serde(default = "default_loopback")]
+    rpc_bind: std::net::IpAddr,
+    /// Public RPC port.
+    public_rpc_port: Option<u16>,
+    /// Public RPC bind address (default: 127.0.0.1).
+    #[serde(default = "default_loopback")]
+    public_rpc_bind: std::net::IpAddr,
+    /// Disable mining.
+    #[serde(default)]
+    no_mine: bool,
+    /// Peers to connect to on startup.
+    #[serde(default)]
+    connect: Vec<String>,
+    /// Network: mainnet or testnet (default: testnet).
+    #[serde(default = "default_network")]
+    network: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StoreSection {
+    /// Archive mode — keep complete block history.
+    #[serde(default)]
+    archive: bool,
+    /// Enable block pruning.
+    #[serde(default)]
     prune: bool,
+    /// Target on-disk size in MB (best-effort).
     prune_target_size_mb: Option<u64>,
+    /// Minimum blocks to keep after pruning.
     prune_keep_depth: Option<u64>,
-    /// Bootstrap seed nodes (`host:port`) to connect to on startup.
-    seeds: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WalletSection {
+    /// Override `$LITC_DATADIR`.
+    data_dir: Option<String>,
+}
+
+/// Mining pool configuration.
+#[derive(Clone, serde::Deserialize)]
+struct PoolConfig {
+    /// Pool fee percentage (e.g. 1.0 = 1 %).
+    #[serde(default)]
+    fee_pct: f64,
+    /// Minimum auto-payout threshold in LIT.
+    #[serde(default = "default_min_payout")]
+    min_payout: String,
+    /// SSE event server port.
+    event_port: Option<u16>,
+}
+
+fn default_p2p_port() -> u16 { 8333 }
+fn default_loopback() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+}
+fn default_network() -> String { "testnet".into() }
+fn default_min_payout() -> String { "0.1".into() }
+
+impl Default for NodeSection {
+    fn default() -> Self {
+        NodeSection {
+            port: default_p2p_port(),
+            rpc_port: None,
+            rpc_bind: default_loopback(),
+            public_rpc_port: None,
+            public_rpc_bind: default_loopback(),
+            no_mine: false,
+            connect: Vec::new(),
+            network: default_network(),
+        }
+    }
+}
+impl Default for StoreSection {
+    fn default() -> Self {
+        StoreSection { archive: false, prune: false, prune_target_size_mb: None, prune_keep_depth: None }
+    }
+}
+impl Default for WalletSection {
+    fn default() -> Self { WalletSection { data_dir: None } }
+}
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig { fee_pct: 0.0, min_payout: default_min_payout(), event_port: None }
+    }
 }
 
 impl NodeConfig {
-    fn default() -> Self {
-        NodeConfig {
-            prune: false,
-            prune_target_size_mb: None,
-            prune_keep_depth: None,
-            seeds: Vec::new(),
+    fn from_file(path: &Path) -> Self {
+        if let Ok(s) = fs::read_to_string(path) {
+            toml::from_str(&s).unwrap_or_default()
+        } else {
+            NodeConfig::default()
         }
     }
 
-    /// Parse a minimal TOML file, reading only the `[node]` section.
-    fn from_file(path: &Path) -> Self {
-        let mut cfg = NodeConfig::default();
-        if let Ok(s) = fs::read_to_string(path) {
-            let mut in_node = false;
-            for line in s.lines() {
-                let line = line.trim();
-                if line.starts_with('[') {
-                    in_node = line == "[node]";
-                    continue;
-                }
-                if !in_node {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    let k = k.trim();
-                    let v = v.trim().trim_matches('"');
-                    match k {
-                        "prune" => cfg.prune = v == "true" || v == "1",
-                        "prune_target_size_mb" => cfg.prune_target_size_mb = v.parse().ok(),
-                        "prune_keep_depth" => cfg.prune_keep_depth = v.parse().ok(),
-                        "seeds" => {
-                            for s in v.split(',') {
-                                let s = s.trim();
-                                if !s.is_empty() {
-                                    cfg.seeds.push(s.to_string());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        cfg
+    fn effective_datadir(&self) -> PathBuf {
+        let env_dd = std::env::var("LITC_DATADIR").ok().map(PathBuf::from);
+        self.wallet.data_dir.as_ref().map(PathBuf::from)
+            .or(env_dd)
+            .unwrap_or_else(|| PathBuf::from("data"))
     }
 
     /// Build the `FileStore` pruning config, if enabled.
     fn prune_config(&self) -> Option<PruneConfig> {
-        if !self.prune {
+        if !self.store.prune {
             return None;
         }
-        // 512 MB / ~182 KB per block body ≈ 2880 blocks (12 h at 15 s).
         const EST_BLOCK_BODY: u64 = 182_000;
         let keep_depth = self
+            .store
             .prune_keep_depth
-            .unwrap_or_else(|| match self.prune_target_size_mb {
+            .unwrap_or_else(|| match self.store.prune_target_size_mb {
                 Some(mb) => ((mb * 1024 * 1024) / EST_BLOCK_BODY).max(1),
                 None => 2880,
             });
@@ -1099,37 +1179,58 @@ fn load_mempool<S: SpendStore + StateStore>(
 /// e.g. `vec!["litc-node", "--port", "8334"]`. Shared by the `litc-node`
 /// binary and the `litc` CLI's `node` subcommand.
 pub fn run(args: Vec<String>) {
-    let mut port = DEFAULT_PORT;
-    let mut connects: Vec<String> = Vec::new();
-    let mut mine = true;
     let mut use_gpu = false;
-    let mut archive = false;
     let mut verify_from_genesis = false;
     let mut fast_sync: Option<String> = None;
     let mut save_snapshot: Option<String> = None;
-    let mut network = Network::Testnet;
-    let mut rpc_port: Option<u16> = None;
-    let mut rpc_bind: std::net::IpAddr =
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
-    let mut public_rpc_port: Option<u16> = None;
-    let mut public_rpc_bind: std::net::IpAddr =
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    let mut config_path: Option<PathBuf> = None;
+
+    // Parse CLI args to extract --config before loading config.
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--config" => {
+                if let Some(s) = args.get(i + 1) {
+                    config_path = Some(PathBuf::from(s));
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let data_dir = std::env::var("LITC_DATADIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data"));
+    let config_path = config_path.unwrap_or_else(|| data_dir.join("config.toml"));
+    let cfg = NodeConfig::from_file(&config_path);
+
+    let data_dir = cfg.effective_datadir();
+
+    // Now re-parse CLI args, using config values as defaults.
+    let mut port = cfg.node.port;
+    let mut connects: Vec<String> = cfg.node.connect.clone();
+    let mut mine = !cfg.node.no_mine;
+    let mut archive = cfg.store.archive;
+    let mut network_str = cfg.node.network.clone();
+    let mut rpc_port: Option<u16> = cfg.node.rpc_port;
+    let mut rpc_bind = cfg.node.rpc_bind;
+    let mut public_rpc_port: Option<u16> = cfg.node.public_rpc_port;
+    let mut public_rpc_bind = cfg.node.public_rpc_bind;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => { i += 2; }
             "--port" => {
                 if let Some(s) = args.get(i + 1) {
-                    if let Ok(p) = s.parse() {
-                        port = p;
-                    }
+                    if let Ok(p) = s.parse() { port = p; }
                 }
                 i += 2;
             }
             "--rpc-port" => {
                 if let Some(s) = args.get(i + 1) {
-                    if let Ok(p) = s.parse() {
-                        rpc_port = Some(p);
-                    }
+                    if let Ok(p) = s.parse() { rpc_port = Some(p); }
                 }
                 i += 2;
             }
@@ -1137,7 +1238,7 @@ pub fn run(args: Vec<String>) {
                 if let Some(s) = args.get(i + 1) {
                     if let Ok(p) = s.parse::<std::net::IpAddr>() {
                         if p.is_unspecified() {
-                            rpc_bind = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+                            rpc_bind = default_loopback();
                             eprintln!("{RED}{BOLD}[warn]{RESET} {YELLOW}--rpc-bind 0.0.0.0 is dangerous (no auth); using 127.0.0.1 instead{RESET}");
                         } else {
                             rpc_bind = p;
@@ -1151,90 +1252,46 @@ pub fn run(args: Vec<String>) {
             }
             "--public-rpc-port" => {
                 if let Some(s) = args.get(i + 1) {
-                    if let Ok(p) = s.parse() {
-                        public_rpc_port = Some(p);
-                    }
+                    if let Ok(p) = s.parse() { public_rpc_port = Some(p); }
                 }
                 i += 2;
             }
             "--public-rpc-bind" => {
                 if let Some(s) = args.get(i + 1) {
-                    if let Ok(p) = s.parse() {
-                        public_rpc_bind = p;
-                    }
+                    if let Ok(p) = s.parse() { public_rpc_bind = p; }
                 }
                 i += 2;
             }
-            "--connect" => {
-                if let Some(c) = args.get(i + 1) {
-                    connects.push(c.clone());
-                }
-                i += 2;
-            }
-            "--seed" => {
+            "--connect" | "--seed" => {
                 if let Some(s) = args.get(i + 1) {
                     connects.push(s.clone());
                 }
                 i += 2;
             }
-            "--no-mine" => {
-                mine = false;
-                i += 1;
-            }
-            "--gpu" => {
-                use_gpu = true;
-                i += 1;
-            }
-            "--archive" => {
-                // Keep the full block history (no pruning).
-                archive = true;
-                i += 1;
-            }
-            "--verify-from-genesis" => {
-                // Null-trust mode: discard any existing state and replay every
-                // block from block 0 (requires the full history to be present).
-                verify_from_genesis = true;
-                i += 1;
-            }
+            "--no-mine" => { mine = false; i += 1; }
+            "--gpu" => { use_gpu = true; i += 1; }
+            "--archive" => { archive = true; i += 1; }
+            "--verify-from-genesis" => { verify_from_genesis = true; i += 1; }
             "--fast-sync" => {
-                // Start from a trusted snapshot instead of replaying history.
-                if let Some(s) = args.get(i + 1) {
-                    fast_sync = Some(s.clone());
-                }
+                if let Some(s) = args.get(i + 1) { fast_sync = Some(s.clone()); }
                 i += 2;
             }
             "--save-snapshot" => {
-                // Write a snapshot of the current state to this directory
-                // (and continue running).
-                if let Some(s) = args.get(i + 1) {
-                    save_snapshot = Some(s.clone());
-                }
+                if let Some(s) = args.get(i + 1) { save_snapshot = Some(s.clone()); }
                 i += 2;
             }
             "--network" => {
-                if let Some(n) = args.get(i + 1) {
-                    if let Ok(net) = n.parse() {
-                        network = net;
-                    }
-                }
+                if let Some(n) = args.get(i + 1) { network_str = n.clone(); }
                 i += 2;
             }
             _ => i += 1,
         }
     }
 
-    let listen: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
-    let data_dir = std::env::var("LITC_DATADIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("data"));
-    let cfg = NodeConfig::from_file(&data_dir.join("config.toml"));
-
-    // Network consensus parameters. `LITC_NETWORK` overrides `--network`; default
-    // is testnet. Checkpoints are empty on a fresh testnet and pinned at launch.
     let network = std::env::var("LITC_NETWORK")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(network);
+        .unwrap_or_else(|| network_str.parse().unwrap_or(Network::Testnet));
     let params = match network {
         Network::Mainnet => ChainParams::mainnet(),
         Network::Testnet => ChainParams::testnet(),
@@ -1244,21 +1301,18 @@ pub fn run(args: Vec<String>) {
         network.as_str()
     );
 
-    // `--verify-from-genesis` intentionally wipes any existing state so the node
-    // re-derives everything from block 0 (the only fully trustless path).
+    let listen: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
+
     if verify_from_genesis {
         eprintln!("{RED}{BOLD}[warn]{RESET} {RED}--verify-from-genesis: discarding existing chain state{RESET}");
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    // Pruning is on by default (bounded disk); `--archive` keeps everything.
     let prune = if archive { None } else { cfg.prune_config() };
 
     let ks = FileKeyStore::new(data_dir.join("wallet.dat"));
     let seed = ks.open_or_create().expect("keystore");
 
-    // Either fast-sync from a snapshot (trustless verify on load) or open the
-    // local chain store.
     let store = if let Some(snap) = &fast_sync {
         println!("{CYAN}{BOLD}[fast-sync]{RESET} {CYAN}loading snapshot from {snap}{RESET}");
         FileStore::load_snapshot(snap, &params)
@@ -1268,28 +1322,15 @@ pub fn run(args: Vec<String>) {
     };
 
     if let Some(snap) = &save_snapshot {
-        let path = std::path::PathBuf::from(snap);
+        let path = PathBuf::from(snap);
         store.save_snapshot(&path).expect("cannot save snapshot");
         println!("{CYAN}{BOLD}[snapshot]{RESET} {CYAN}saved to {snap}{RESET}");
     }
     let node = Arc::new(Mutex::new(Node::<FileStore>::new(store, seed, params)));
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-    // Known addresses for bootstrap + gossip (seeds, CLI, config, learned).
     let known: AddrSet = Arc::new(Mutex::new(HashSet::new()));
     known.lock().unwrap().insert(listen);
-    // Resolve all seed/connect hostnames *once* so that DNS round-robin or
-    // IPv4/IPv6 ordering differences can't produce two different addresses
-    // for the same hostname (which would bypass the connecting-set guard).
     let mut connect_targets: Vec<SocketAddr> = Vec::new();
-    for s in cfg.seeds.iter() {
-        if let Ok(addr) = s.parse::<SocketAddr>() {
-            known.lock().unwrap().insert(addr);
-        } else if let Ok(mut addrs) = s.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
-                known.lock().unwrap().insert(addr);
-            }
-        }
-    }
     for s in connects.iter() {
         if let Ok(addr) = s.parse::<SocketAddr>() {
             known.lock().unwrap().insert(addr);
@@ -1302,8 +1343,6 @@ pub fn run(args: Vec<String>) {
         }
     }
 
-    // Load any pending transactions dropped into the mempool directory (e.g. by
-    // the `litc wallet send*` commands) and relay them.
     load_mempool(&data_dir, &node, &peers);
 
     let connecting: AddrSet = Arc::new(Mutex::new(HashSet::new()));
@@ -1344,8 +1383,6 @@ pub fn run(args: Vec<String>) {
         connect_to(addr, p, nd, kn, listen, &connecting);
     }
 
-    // Always spawn the miner loop (so mining can be toggled at runtime via RPC).
-    // The --no-mine flag just sets the initial state.
     {
         let mut n = node.lock().unwrap();
         n.mining_enabled = mine;
@@ -1366,6 +1403,7 @@ pub fn run(args: Vec<String>) {
         }
         #[cfg(not(feature = "gpu"))]
         {
+            let _ = use_gpu;
             eprintln!("{YELLOW}{BOLD}[gpu]{RESET} {YELLOW}node built without --features gpu; using CPU miner{RESET}");
             Box::new(CpuMiner)
         }

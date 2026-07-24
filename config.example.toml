@@ -1,0 +1,49 @@
+# ──────────────────────────────────────────────
+# LiTC node configuration
+# Copy this to ./data/config.toml (or $LITC_DATADIR/config.toml) and edit.
+# CLI flags override individual fields at runtime.
+# ──────────────────────────────────────────────
+
+[node]
+# P2P listen port (default: 8333)
+# port = 8333
+
+# Admin RPC — full wallet access, bind only to loopback!
+rpc_port = 18334
+rpc_bind = "127.0.0.1"
+
+# Public RPC — read-only + pool mining (safe to expose)
+public_rpc_port = 18335
+public_rpc_bind = "127.0.0.1"
+
+# Disable mining (relay-only node)
+# no_mine = false
+
+# Peers to connect to on startup
+# connect = ["seed1.litc.net:8333", "seed2.litc.net:8333"]
+
+# Network: "mainnet" or "testnet" (default: testnet)
+network = "testnet"
+
+[wallet]
+# Override data directory (default: ./data or $LITC_DATADIR)
+# data_dir = "./data"
+
+[store]
+# Archive mode — keep full block history (no pruning)
+# archive = false
+
+# Block pruning (on by default if archive is false)
+prune = true
+# Target on-disk size in MB (best-effort)
+# prune_target_size_mb = 1000
+# Minimum blocks to keep after pruning
+# prune_keep_depth = 288
+
+[pool]
+# Pool fee percentage (taken from miner rewards)
+fee_pct = 1.0
+# Minimum auto-payout threshold in LIT
+min_payout = "0.1"
+# SSE event server port (for real-time miner updates)
+# event_port = 18336
